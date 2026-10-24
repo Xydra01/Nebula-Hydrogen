@@ -114,21 +114,37 @@ bool Tokenizer::load(const GGUFModel& model) {
 void Tokenizer::init_byte_tokens() {
     std::memset(byte_tokens_, 0, sizeof(byte_tokens_));
     has_byte_tokens_ = true;
+    unicode_to_byte_.clear();
 
+    int n = 0;
     for (int b = 0; b < 256; ++b) {
-        std::string hex_tok = byte_to_hex_token(static_cast<uint8_t>(b));
-        auto it = token_to_id_.find(hex_tok);
+        bool self_map = (b >= '!' && b <= '~') ||
+                        (b >= 0xA1 && b <= 0xAC) ||
+                        (b >= 0xAE && b <= 0xFF);
+        std::string utf8_char;
+        if (self_map) {
+            if (b < 0x80) {
+                utf8_char.push_back(static_cast<char>(b));
+            } else {
+                utf8_char.push_back(static_cast<char>(0xC0 | ((b >> 6) & 0x1F)));
+                utf8_char.push_back(static_cast<char>(0x80 | (b & 0x3F)));
+            }
+        } else {
+            int cp = 256 + n;
+            utf8_char.push_back(static_cast<char>(0xC0 | ((cp >> 6) & 0x1F)));
+            utf8_char.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            n++;
+        }
+        byte_to_unicode_[b] = utf8_char;
+        unicode_to_byte_[utf8_char] = static_cast<uint8_t>(b);
+
+        auto it = token_to_id_.find(utf8_char);
         if (it != token_to_id_.end()) {
             byte_tokens_[b] = it->second;
         } else {
-            // Check direct single-char string
-            std::string single_char(1, static_cast<char>(b));
-            auto it_single = token_to_id_.find(single_char);
-            if (it_single != token_to_id_.end()) {
-                byte_tokens_[b] = it_single->second;
-            } else {
-                byte_tokens_[b] = 0;
-            }
+            std::string hex_tok = byte_to_hex_token(static_cast<uint8_t>(b));
+            auto it_hex = token_to_id_.find(hex_tok);
+            byte_tokens_[b] = (it_hex != token_to_id_.end()) ? it_hex->second : 0;
         }
     }
 }
@@ -261,6 +277,8 @@ std::vector<uint32_t> Tokenizer::encode(const std::string& text, bool add_specia
     static const std::vector<std::string> special_tokens = {
         "<|im_start|>",
         "<|im_end|>",
+        "<think>",
+        "</think>",
         "<|endoftext|>",
         "<|extra_0|>",
         "<tool_call>",
@@ -271,42 +289,64 @@ std::vector<uint32_t> Tokenizer::encode(const std::string& text, bool add_specia
         if (segment.empty()) return;
 
         if (is_bpe_) {
-            // Simple fast tokenization: check exact string, then fallback to word BPE
+            // Check exact string in vocabulary first
             auto it_exact = token_to_id_.find(segment);
             if (it_exact != token_to_id_.end()) {
                 tokens.push_back(it_exact->second);
                 return;
             }
 
-            // Word-level BPE split
+            // Word-level pre-tokenization
             size_t pos = 0;
-            while (pos < segment.size()) {
-                // Find next whitespace or chunk
-                size_t next_space = segment.find_first_of(" \t\n\r", pos);
-                std::string word;
-                if (next_space == std::string::npos) {
-                    word = segment.substr(pos);
-                    pos = segment.size();
-                } else if (next_space == pos) {
-                    word = segment.substr(pos, 1);
+            const size_t n = segment.size();
+            while (pos < n) {
+                unsigned char c = static_cast<unsigned char>(segment[pos]);
+                size_t start = pos;
+                if (c == '\r' || c == '\n') {
+                    while (pos < n && (segment[pos] == '\r' || segment[pos] == '\n')) {
+                        pos++;
+                    }
+                } else if (c == ' ' || c == '\t') {
+                    if (pos + 1 < n && std::isalpha(static_cast<unsigned char>(segment[pos + 1]))) {
+                        pos++;
+                        while (pos < n && std::isalpha(static_cast<unsigned char>(segment[pos]))) {
+                            pos++;
+                        }
+                    } else {
+                        while (pos < n && (segment[pos] == ' ' || segment[pos] == '\t')) {
+                            pos++;
+                        }
+                    }
+                } else if (std::isalpha(c)) {
+                    while (pos < n && std::isalpha(static_cast<unsigned char>(segment[pos]))) {
+                        pos++;
+                    }
+                } else if (std::isdigit(c)) {
                     pos++;
                 } else {
-                    word = segment.substr(pos, next_space - pos);
-                    pos = next_space;
+                    pos++;
                 }
 
-                auto it_word = token_to_id_.find(word);
+                std::string chunk = segment.substr(start, pos - start);
+                // Convert chunk's raw bytes to GPT-2 unicode mapping
+                std::string chunk_mapped;
+                chunk_mapped.reserve(chunk.size() * 2);
+                for (unsigned char b : chunk) {
+                    chunk_mapped += byte_to_unicode_[b];
+                }
+
+                auto it_word = token_to_id_.find(chunk_mapped);
                 if (it_word != token_to_id_.end()) {
                     tokens.push_back(it_word->second);
                 } else {
                     // Apply BPE pair merges
-                    std::vector<std::string> subwords = bpe_tokenize_word(word);
+                    std::vector<std::string> subwords = bpe_tokenize_word(chunk_mapped);
                     for (const auto& sw : subwords) {
                         auto it_sw = token_to_id_.find(sw);
                         if (it_sw != token_to_id_.end()) {
                             tokens.push_back(it_sw->second);
                         } else {
-                            // Byte fallback
+                            // Single character fallback
                             for (unsigned char b : sw) {
                                 tokens.push_back(byte_tokens_[b]);
                             }
@@ -372,24 +412,37 @@ std::string Tokenizer::decode_token(uint32_t token_id) const {
         }
     }
 
-    // Replace SentencePiece space " " (0xE2 0x96 0x81) with regular space ' '
     std::string out;
     out.reserve(raw.size());
-    for (size_t i = 0; i < raw.size(); ++i) {
+    for (size_t i = 0; i < raw.size();) {
         unsigned char c = static_cast<unsigned char>(raw[i]);
+        // SentencePiece space " " (0xE2 0x96 0x81)
         if (c == 0xe2 && i + 2 < raw.size() &&
             static_cast<unsigned char>(raw[i + 1]) == 0x96 &&
             static_cast<unsigned char>(raw[i + 2]) == 0x81) {
             out += ' ';
-            i += 2;
-        } else if (c == 0xc4 && i + 1 < raw.size() &&
-                   static_cast<unsigned char>(raw[i + 1]) == 0xa0) {
-            // GPT-2 BPE space "Ġ" (0xC4 0xA0)
-            out += ' ';
-            i += 1;
-        } else {
-            out += raw[i];
+            i += 3;
+            continue;
         }
+
+        // GPT-2 BPE unicode character mapping check
+        size_t len = 1;
+        if ((c & 0xE0) == 0xC0) len = 2;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else if ((c & 0xF8) == 0xF0) len = 4;
+
+        if (i + len <= raw.size()) {
+            std::string sub = raw.substr(i, len);
+            auto it = unicode_to_byte_.find(sub);
+            if (it != unicode_to_byte_.end()) {
+                out += static_cast<char>(it->second);
+                i += len;
+                continue;
+            }
+        }
+
+        out += raw[i];
+        i++;
     }
 
     return out;

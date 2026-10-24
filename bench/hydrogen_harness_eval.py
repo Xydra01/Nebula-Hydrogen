@@ -15,6 +15,7 @@ KV_BYTES_PER_TOKEN_FP16 = 64 * 1024  # 64 KiB per token (Qwen2.5-Coder 7B / 14B)
 MAX_ALLOWED_KV_CACHE_BYTES = int(3.5 * 1024 * 1024 * 1024)  # 3.5 GB ceiling
 SERIAL_LLAMA_CPP_LATENCY_SECS = 235.0  # ~3.9 minutes baseline for 8 serial probes
 MAX_ALLOWED_HYDROGEN_LATENCY_SECS = 40.0  # Strictly < 40 seconds acceptance criteria
+MIN_AGGREGATE_THROUGHPUT_TOKENS_PER_SEC = 500.0  # Acceptance criteria: >= 500 tokens/s
 
 
 @dataclasses.dataclass(frozen=True)
@@ -55,6 +56,12 @@ class BatchedEvalSummary:
     @property
     def kv_cache_gib(self) -> float:
         return self.kv_cache_bytes / (1024 * 1024 * 1024)
+
+    @property
+    def aggregate_throughput_tokens_per_sec(self) -> float:
+        if self.wall_clock_seconds <= 0:
+            return 0.0
+        return self.total_kv_tokens / self.wall_clock_seconds
 
 
 class HydrogenHarnessEvaluator:

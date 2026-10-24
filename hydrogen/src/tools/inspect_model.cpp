@@ -125,14 +125,34 @@ int main(int argc, char* argv[]) {
             }
 
             std::cout << "---------------------------------------------------\n"
-                      << "First 5 Tensors:\n";
-            size_t n_first = std::min<size_t>(5, model.tensors.size());
-            for (size_t i = 0; i < n_first; ++i) {
-                const auto& t = model.tensors[i];
-                std::cout << "  [" << i << "] " << std::left << std::setw(38) << t.name
-                          << " | Type: " << std::setw(8) << hydrogen::ggml_type_name(t.type)
-                          << " | Size: " << std::setw(10) << t.size_bytes << " B"
-                          << " | Offset: " << t.offset << "\n";
+                      << "Metadata Entries (" << model.metadata.size() << "):\n";
+            for (const auto& [k, v] : model.metadata) {
+                if (v.type == hydrogen::GGUFType::ARRAY) {
+                    std::cout << "  " << k << " = [ARRAY len=" << v.as_array().size() << "]\n";
+                } else if (v.type == hydrogen::GGUFType::STRING) {
+                    std::string s = v.as_string();
+                    if (s.size() > 60) s = s.substr(0, 57) + "...";
+                    std::cout << "  " << k << " = \"" << s << "\"\n";
+                } else {
+                    std::cout << "  " << k << " = " << v.as_string() << "\n";
+                }
+            }
+
+            std::cout << "---------------------------------------------------\n"
+                      << "Key Tensors (Global & Blk 0 & Blk 3):\n";
+            for (const auto& t : model.tensors) {
+                if (t.name.find("token_embd") != std::string::npos ||
+                    t.name.find("output") != std::string::npos ||
+                    t.name.find("blk.0.") != std::string::npos ||
+                    t.name.find("blk.3.") != std::string::npos) {
+                    std::cout << "  " << std::left << std::setw(35) << t.name
+                              << " | Type: " << std::setw(8) << hydrogen::ggml_type_name(t.type)
+                              << " | Shape: [";
+                    for (size_t d = 0; d < t.shape.size(); ++d) {
+                        std::cout << (d > 0 ? ", " : "") << t.shape[d];
+                    }
+                    std::cout << "] | Size: " << t.size_bytes << " B\n";
+                }
             }
             std::cout << "===================================================" << std::endl;
         }

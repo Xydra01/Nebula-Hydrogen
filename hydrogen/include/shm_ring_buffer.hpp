@@ -162,6 +162,8 @@ private:
     mutable std::mutex request_mutex_;
 
     bool adaptive_signaling_ = true;
+    uint32_t unsignaled_tokens_ = 0;
+    static constexpr uint32_t MAX_UNSIGNALED_TOKENS = 16;
     uint64_t total_events_signaled_ = 0;
     uint64_t total_signals_suppressed_ = 0;
 };

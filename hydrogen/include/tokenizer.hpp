@@ -69,6 +69,10 @@ private:
     uint32_t byte_tokens_[256];
     bool has_byte_tokens_ = false;
 
+    // GPT-2 Byte-to-Unicode and Unicode-to-Byte mappings
+    std::string byte_to_unicode_[256];
+    std::unordered_map<std::string, uint8_t> unicode_to_byte_;
+
     // Helper functions
     void init_byte_tokens();
     std::vector<std::string> bpe_tokenize_word(const std::string& word) const;

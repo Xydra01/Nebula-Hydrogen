@@ -401,7 +401,7 @@ int main() {
 
         decoder.clear_grammar();
         REQUIRE(!decoder.has_active_grammar());
-        REQUIRE(decoder.device_fsm_bitmasks() == nullptr);
+        REQUIRE(decoder.device_fsm_bitmasks() != nullptr); // Buffer is pooled and retained for zero-overhead tool reuse!
 
         std::cout << " [PASS] Test 9: Zero-Copy FSM Bitmask Staging & Synchronization\n";
         passed_tests++;
@@ -502,9 +502,9 @@ int main() {
                   << "         OS SetEvent Signals: " << signaled << "\n"
                   << "         Suppressed Redundant Syscalls: " << suppressed << "\n";
 
-        // Under continuous streaming into non-empty buffer, initial was empty (1 signal) and subsequent are suppressed
-        REQUIRE(signaled >= 1);
-        REQUIRE(suppressed >= 90);
+        // Under continuous streaming, empty was signaled, heartbeat triggers every 16 tokens
+        REQUIRE(signaled >= 1 && signaled <= 10);
+        REQUIRE(suppressed >= 85);
 
         // Urgent frame (END_OF_STREAM) must signal regardless of queue depth
         server.send_token(1, 248046, 1.0f, "", true);
@@ -515,9 +515,76 @@ int main() {
         passed_tests++;
     }
 
+    // ------------------------------------------------------------------------
+    // TEST 12: Zero-Allocation Tool Switching & Batched Block Pre-allocation (H23)
+    // ------------------------------------------------------------------------
+    {
+        std::cout << "[TEST 12] Zero-Allocation Tool Switching & Batched Block Pre-allocation...\n";
+        NativeDecoder decoder;
+        constexpr size_t TOTAL_PAGES = 1024;
+        constexpr uint32_t BLOCK_SIZE = 16;
+        constexpr uint32_t MAX_BLOCKS = 2048;
+
+        bool ok = decoder.enable_dynamic_paged_kv(TOTAL_PAGES, BLOCK_SIZE, MAX_BLOCKS);
+        REQUIRE(ok);
+
+        // 1. Batched Block Allocation
+        size_t allocated = decoder.allocate_stream_blocks_batch(0, 0, 16);
+        REQUIRE(allocated == 16);
+
+        // Verify subsequent calls return cached blocks without reallocating
+        for (uint32_t b = 0; b < 16; ++b) {
+            uint32_t pid = decoder.allocate_stream_block(0, b);
+            REQUIRE(pid != INVALID_PAGE_ID);
+        }
+
+        // 2. Zero-Allocation Tool Schema Switching (Buffer Pooling)
+        grammar::ToolSchema tool_a;
+        tool_a.name = "tool_a";
+        tool_a.properties.push_back({"param_a", grammar::PropertyType::String, true});
+        decoder.set_grammar_schema(tool_a);
+        const void* ptr_a = decoder.device_fsm_bitmasks();
+        REQUIRE(ptr_a != nullptr);
+
+        decoder.clear_grammar();
+
+        grammar::ToolSchema tool_b;
+        tool_b.name = "tool_b";
+        tool_b.properties.push_back({"param_b", grammar::PropertyType::Integer, true});
+        decoder.set_grammar_schema(tool_b);
+        const void* ptr_b = decoder.device_fsm_bitmasks();
+        REQUIRE(ptr_b != nullptr);
+
+        // Verify device memory buffer was pooled and reused without cudaMalloc/cudaFree churn
+        REQUIRE(ptr_a == ptr_b);
+
+        // 3. IPC Heartbeat Starvation Prevention (Every 16 tokens max latency)
+        std::wstring test_shm = L"Local\\Hydrogen_H23_Heartbeat_Test_" + std::to_wstring(rand() % 100000);
+        ShmServer server(test_shm);
+        REQUIRE(server.initialize());
+
+        // Emit exactly 32 tokens
+        for (uint32_t i = 0; i < 32; ++i) {
+            server.send_token(1, 2000 + i, 1.0f, "hb", false);
+        }
+
+        // 32 tokens: token 0 signals (was empty), token 17 signals (16 unsignaled), total = 2 signals
+        REQUIRE(server.total_events_signaled() >= 2);
+        REQUIRE(server.total_signals_suppressed() >= 25);
+
+        decoder.disable_dynamic_paged_kv();
+
+        std::cout << "         Batched 16 Blocks (256 tokens) Pre-allocated: OK\n"
+                  << "         Reused Pooled Device Bitmask Pointer: " << ptr_a << "\n"
+                  << "         Bounded Starvation Heartbeat (Signals: " << server.total_events_signaled()
+                  << ", Suppressed: " << server.total_signals_suppressed() << "): OK\n"
+                  << " [PASS] Test 12: Zero-Allocation Tool Switching & Batched Pre-allocation\n";
+        passed_tests++;
+    }
+
     std::cout << "--------------------------------------------------------\n"
-              << " Tests Passed: " << passed_tests << " / 11\n"
-              << " Status: ALL H20, H21 & H22 GRAMMAR, RADIX KV & IPC TESTS PASSED\n"
+              << " Tests Passed: " << passed_tests << " / 12\n"
+              << " Status: ALL H20, H21, H22 & H23 TESTS PASSED\n"
               << "========================================================\n"
               << std::flush;
 

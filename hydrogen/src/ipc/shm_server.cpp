@@ -355,18 +355,22 @@ bool ShmServer::send_response(MessageType msg_type,
     const bool is_urgent = (flags & FrameFlags::END_OF_STREAM) != 0 ||
                            msg_type == MessageType::MSG_TOOL_CALL ||
                            msg_type == MessageType::MSG_PONG;
+    const bool is_heartbeat_forced = (unsignaled_tokens_ >= MAX_UNSIGNALED_TOKENS);
 
     const bool ok = response_ring_.write_frame(msg_type, stream_id, flags, payload, payload_size, sequence_num);
     if (ok) {
 #ifdef _WIN32
         if (h_engine_event_) {
             // Adaptive signaling: only trigger OS kernel transition if consumer was idle
-            // (empty queue) or frame requires immediate delivery (EOS / ToolCall / Pong).
-            if (!adaptive_signaling_ || was_empty || is_urgent) {
+            // (empty queue), frame requires immediate delivery (EOS / ToolCall / Pong),
+            // or heartbeat limit reached to prevent consumer starvation under high frequency.
+            if (!adaptive_signaling_ || was_empty || is_urgent || is_heartbeat_forced) {
                 SetEvent(h_engine_event_);
                 total_events_signaled_++;
+                unsignaled_tokens_ = 0;
             } else {
                 total_signals_suppressed_++;
+                unsignaled_tokens_++;
             }
         }
 #endif

@@ -149,12 +149,13 @@ public:
     [[nodiscard]] bool is_paged_kv_enabled() const noexcept { return paged_kv_.is_paged_enabled; }
     [[nodiscard]] const PagedKvTable& paged_kv_table() const noexcept { return paged_kv_; }
 
-    // Dynamic Radix Page Pool Engine (Issue H22)
+    // Dynamic Radix Page Pool Engine (Issue H22 / H23)
     bool enable_dynamic_paged_kv(size_t total_pages = 1024, uint32_t block_size = 16, uint32_t max_blocks_per_stream = 2048);
     void disable_dynamic_paged_kv();
     size_t register_shared_prefix(std::span<const int32_t> prefix_tokens);
     size_t attach_stream_to_prefix(uint32_t stream_slot, std::span<const int32_t> prompt_tokens);
     uint32_t allocate_stream_block(uint32_t stream_slot, uint32_t logical_block);
+    size_t allocate_stream_blocks_batch(uint32_t stream_slot, uint32_t start_block, uint32_t num_blocks);
     void release_stream_blocks(uint32_t stream_slot);
     [[nodiscard]] std::shared_ptr<PagePool> page_pool() const noexcept { return page_pool_; }
     [[nodiscard]] std::shared_ptr<RadixTree> radix_tree() const noexcept { return radix_tree_; }
@@ -248,6 +249,12 @@ private:
     float* d_top_logits_ = nullptr;
     uint32_t* h_top_tokens_ = nullptr;
     float* h_top_logits_ = nullptr;
+
+    // Hadamard Outlier Rotation Buffers (PrismML PTQ1_0)
+    bool has_hadamard_ = false;
+    int8_t* d_signs_5120_ = nullptr;
+    int8_t* d_signs_6144_ = nullptr;
+    int8_t* d_signs_17408_ = nullptr;
 
     // CUDA Stream
     void* cuda_stream_ = nullptr;

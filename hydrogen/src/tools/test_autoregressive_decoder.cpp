@@ -49,13 +49,15 @@ int main(int argc, char* argv[]) {
               << std::flush;
 
     // Test Tokenizer in isolation
-    std::string test_prompt = "Hello! What is 2 + 2?";
+    std::string test_prompt = "<|im_start|>user\nHello! What is 2 + 2?<|im_end|>\n<|im_start|>assistant\n<think>\n";
     std::vector<uint32_t> tokens = decoder.tokenizer().encode(test_prompt);
     if (tokens.empty()) {
         std::cerr << "[FAIL] Tokenizer returned empty token sequence for test prompt.\n";
         return 1;
     }
-    std::cout << "[PASS] Tokenizer encoded prompt into " << tokens.size() << " tokens.\n";
+    std::cout << "[PASS] Tokenizer encoded prompt into " << tokens.size() << " tokens:\n       ";
+    for (auto t : tokens) std::cout << t << " ";
+    std::cout << "\n";
 
     // Test Autoregressive Generation
     std::cout << "[INFO] Running autoregressive generation test with ChatML prompt:\n"
@@ -63,9 +65,9 @@ int main(int argc, char* argv[]) {
               << "       Streaming tokens: \n\n" << std::flush;
 
     hydrogen::SamplingConfig sampling;
-    sampling.temperature = 0.7f;
-    sampling.top_p = 0.80f;
-    sampling.repetition_penalty = 1.05f;
+    sampling.temperature = 0.0f; // greedy argmax to verify cleanest prediction
+    sampling.top_p = 1.0f;
+    sampling.repetition_penalty = 1.0f;
 
     int token_count = 0;
     auto gen_start = std::chrono::high_resolution_clock::now();

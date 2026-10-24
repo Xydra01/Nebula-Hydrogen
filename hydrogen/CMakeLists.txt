@@ -161,6 +161,20 @@ target_link_libraries(hydrogen_test_tool_grammar_and_calling PRIVATE
     CUDA::cudart
 )
 
+# Standalone Dual Sub-Block PTQ1_0 & Walsh-Hadamard Transform Test (Issue H23)
+add_executable(hydrogen_test_hadamard_and_tq1
+    src/tools/test_hadamard_and_tq1.cu
+)
+
+target_include_directories(hydrogen_test_hadamard_and_tq1 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_link_libraries(hydrogen_test_hadamard_and_tq1 PRIVATE
+    CUDA::cudart
+)
+
 set_target_properties(hydrogen_engine PROPERTIES
     CUDA_SEPARABLE_COMPILATION OFF
 )

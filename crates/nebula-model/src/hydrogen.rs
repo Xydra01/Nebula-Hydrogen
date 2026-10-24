@@ -173,19 +173,11 @@ impl HydrogenBackend {
         pong_notify: &tokio::sync::Notify,
     ) {
         while !cancel.is_cancelled() {
-            // Wait for engine event with 50ms timeout to regularly check cancellation.
-            match shm.wait_engine_event(50) {
-                Ok(()) => {}
-                Err(nebula_hydrogen::IpcError::Timeout { .. }) => continue,
-                Err(e) => {
-                    tracing::warn!(event = "hydrogen.wait_engine_event_error", error = %e);
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                    continue;
-                }
-            }
+            let mut drained_any = false;
 
-            // Drain all available frames from the response ring buffer.
+            // Drain all available frames from the response ring buffer until empty.
             while let Some(frame) = shm.peek_response_frame() {
+                drained_any = true;
                 let payload = match shm.read_response_payload(frame.payload_size as usize) {
                     Ok(p) => p,
                     Err(e) => {
@@ -284,6 +276,21 @@ impl HydrogenBackend {
 
                 if remove {
                     table.remove(&frame.stream_id);
+                }
+            }
+
+            if drained_any {
+                continue;
+            }
+
+            // Buffer was empty: wait for engine event with 50ms timeout to regularly check cancellation.
+            match shm.wait_engine_event(50) {
+                Ok(()) => {}
+                Err(nebula_hydrogen::IpcError::Timeout { .. }) => continue,
+                Err(e) => {
+                    tracing::warn!(event = "hydrogen.wait_engine_event_error", error = %e);
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
                 }
             }
         }
