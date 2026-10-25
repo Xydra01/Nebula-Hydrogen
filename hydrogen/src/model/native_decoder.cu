@@ -1117,7 +1117,7 @@ bool NativeDecoder::enable_dynamic_paged_kv(size_t total_pages, uint32_t block_s
     paged_kv_.max_blocks_per_stream = max_blocks_per_stream;
     paged_kv_.total_pages = total_pages;
 
-    size_t table_entries = static_cast<size_t>(MAX_STREAMS) * max_blocks_per_stream;
+    size_t table_entries = static_cast<size_t>(max_streams_) * max_blocks_per_stream;
     h_stream_block_table_.assign(table_entries, INVALID_PAGE_ID);
 
     size_t page_total_stride = 16ULL * block_size * head_count_kv_ * head_dim_;
@@ -1138,7 +1138,7 @@ bool NativeDecoder::enable_dynamic_paged_kv(size_t total_pages, uint32_t block_s
 
 void NativeDecoder::disable_dynamic_paged_kv() {
     unbind_paged_kv();
-    for (uint32_t s = 0; s < MAX_STREAMS; ++s) {
+    for (uint32_t s = 0; s < max_streams_; ++s) {
         release_stream_blocks(s);
     }
     if (d_dynamic_block_table_) {
@@ -1165,7 +1165,7 @@ size_t NativeDecoder::register_shared_prefix(std::span<const int32_t> prefix_tok
 }
 
 size_t NativeDecoder::attach_stream_to_prefix(uint32_t stream_slot, std::span<const int32_t> prompt_tokens) {
-    if (!radix_tree_ || stream_slot >= MAX_STREAMS || prompt_tokens.empty()) return 0;
+    if (!radix_tree_ || stream_slot >= max_streams_ || prompt_tokens.empty()) return 0;
     auto match = radix_tree_->match_longest_prefix(prompt_tokens);
     if (match.matched_tokens == 0 || !match.last_node) return 0;
 
@@ -1192,7 +1192,7 @@ size_t NativeDecoder::attach_stream_to_prefix(uint32_t stream_slot, std::span<co
 }
 
 size_t NativeDecoder::allocate_stream_blocks_batch(uint32_t stream_slot, uint32_t start_block, uint32_t num_blocks) {
-    if (stream_slot >= MAX_STREAMS || !page_pool_ || num_blocks == 0) {
+    if (stream_slot >= max_streams_ || !page_pool_ || num_blocks == 0) {
         return 0;
     }
     if (start_block + num_blocks > paged_kv_.max_blocks_per_stream) {
@@ -1249,7 +1249,7 @@ size_t NativeDecoder::allocate_stream_blocks_batch(uint32_t stream_slot, uint32_
 }
 
 uint32_t NativeDecoder::allocate_stream_block(uint32_t stream_slot, uint32_t logical_block) {
-    if (stream_slot >= MAX_STREAMS || !page_pool_ || logical_block >= paged_kv_.max_blocks_per_stream) {
+    if (stream_slot >= max_streams_ || !page_pool_ || logical_block >= paged_kv_.max_blocks_per_stream) {
         return INVALID_PAGE_ID;
     }
     size_t table_idx = stream_slot * paged_kv_.max_blocks_per_stream + logical_block;
@@ -1267,7 +1267,7 @@ uint32_t NativeDecoder::allocate_stream_block(uint32_t stream_slot, uint32_t log
 }
 
 void NativeDecoder::release_stream_blocks(uint32_t stream_slot) {
-    if (stream_slot >= MAX_STREAMS) return;
+    if (stream_slot >= max_streams_) return;
     if (stream_radix_nodes_[stream_slot]) {
         if (radix_tree_) {
             radix_tree_->release_branch(stream_radix_nodes_[stream_slot]);
@@ -1375,8 +1375,20 @@ NativeDecoder::~NativeDecoder() {
     }
 }
 
-bool NativeDecoder::initialize(const std::filesystem::path& model_path) {
+bool NativeDecoder::initialize(
+    const std::filesystem::path& model_path,
+    uint32_t max_streams,
+    uint32_t max_seq_len
+) {
     if (initialized_) return true;
+
+    max_streams_ = (max_streams > 0) ? max_streams : DEFAULT_MAX_STREAMS;
+    max_seq_len_ = (max_seq_len > 0) ? max_seq_len : DEFAULT_MAX_SEQ_LEN;
+    stream_seq_pos_.assign(max_streams_, 0);
+    stream_allocated_pages_.clear();
+    stream_allocated_pages_.resize(max_streams_);
+    stream_radix_nodes_.clear();
+    stream_radix_nodes_.resize(max_streams_);
 
     try {
         loader_.load(model_path);
@@ -1522,20 +1534,20 @@ bool NativeDecoder::initialize(const std::filesystem::path& model_path) {
     CUDA_CHECK(cudaMalloc(&d_ffn_out_, embedding_dim_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_logits_, vocab_size_ * sizeof(float)));
 
-    // Multi-Stream KV Cache (MAX_STREAMS * 16 layers, MAX_SEQ_LEN tokens, 4 heads, 256 dim)
-    size_t kv_cache_elements = static_cast<size_t>(MAX_STREAMS) * 16ULL * MAX_SEQ_LEN * 4 * 256;
+    // Multi-Stream KV Cache (max_streams_ * 16 layers, max_seq_len_ tokens, 4 heads, 256 dim)
+    size_t kv_cache_elements = static_cast<size_t>(max_streams_) * 16ULL * max_seq_len_ * 4 * 256;
     CUDA_CHECK(cudaMalloc(&d_k_cache_, kv_cache_elements * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_v_cache_, kv_cache_elements * sizeof(float)));
     CUDA_CHECK(cudaMemsetAsync(d_k_cache_, 0, kv_cache_elements * sizeof(float), stream));
     CUDA_CHECK(cudaMemsetAsync(d_v_cache_, 0, kv_cache_elements * sizeof(float), stream));
 
-    // Multi-Stream Gated DeltaNet Matrix State (MAX_STREAMS * 48 layers * 48 heads * 128 * 128 floats)
-    size_t ssm_state_elements = static_cast<size_t>(MAX_STREAMS) * 48ULL * 48ULL * 16384ULL;
+    // Multi-Stream Gated DeltaNet Matrix State (max_streams_ * 48 layers * 48 heads * 128 * 128 floats)
+    size_t ssm_state_elements = static_cast<size_t>(max_streams_) * 48ULL * 48ULL * 16384ULL;
     CUDA_CHECK(cudaMalloc(&d_ssm_state_, ssm_state_elements * sizeof(float)));
     CUDA_CHECK(cudaMemsetAsync(d_ssm_state_, 0, ssm_state_elements * sizeof(float), stream));
 
-    // Multi-Stream SSM Conv1D History Buffer (MAX_STREAMS * 48 layers * 4 steps * 10240 floats)
-    size_t conv_state_elements = static_cast<size_t>(MAX_STREAMS) * 48ULL * 4ULL * 10240ULL;
+    // Multi-Stream SSM Conv1D History Buffer (max_streams_ * 48 layers * 4 steps * 10240 floats)
+    size_t conv_state_elements = static_cast<size_t>(max_streams_) * 48ULL * 4ULL * 10240ULL;
     CUDA_CHECK(cudaMalloc(&d_ssm_conv_state_, conv_state_elements * sizeof(float)));
     CUDA_CHECK(cudaMemsetAsync(d_ssm_conv_state_, 0, conv_state_elements * sizeof(float), stream));
 
@@ -1559,7 +1571,7 @@ bool NativeDecoder::initialize(const std::filesystem::path& model_path) {
     CUDA_CHECK(cudaStreamSynchronize(stream));
     initialized_ = true;
     std::cout << "[Hydrogen NativeDecoder] Initialized successfully. 64 layers loaded in GPU VRAM (Multi-Stream: "
-              << MAX_STREAMS << " streams, Context: " << MAX_SEQ_LEN << " tokens). Vocab: "
+              << max_streams_ << " streams, Context: " << max_seq_len_ << " tokens). Vocab: "
               << vocab_size_ << " tokens.\n";
     return true;
 }
@@ -1759,7 +1771,7 @@ void NativeDecoder::forward_token(
                 d_attn_out_,
                 attn_layer_counter,
                 pos,
-                MAX_SEQ_LEN,
+                max_seq_len_,
                 head_count_,
                 head_count_kv_,
                 head_dim_,
@@ -1935,7 +1947,7 @@ void NativeDecoder::forward_token(
 }
 
 void NativeDecoder::release_stream_slot(uint32_t stream_slot) {
-    if (stream_slot >= MAX_STREAMS) return;
+    if (stream_slot >= max_streams_) return;
     stream_seq_pos_[stream_slot] = 0;
     if (page_pool_) {
         release_stream_blocks(stream_slot);
@@ -1957,9 +1969,9 @@ void NativeDecoder::generate(
     if (!initialized_) return;
 
     cudaStream_t stream = static_cast<cudaStream_t>(cuda_stream_);
-    uint32_t stream_slot = stream_id % MAX_STREAMS;
+    uint32_t stream_slot = stream_id % max_streams_;
 
-    size_t stream_kv_stride = 16ULL * MAX_SEQ_LEN * 4 * 256;
+    size_t stream_kv_stride = 16ULL * max_seq_len_ * 4 * 256;
     size_t stream_ssm_stride = 48ULL * 48ULL * 16384ULL;
     size_t stream_conv_stride = 48ULL * 4ULL * 10240ULL;
 
@@ -2019,7 +2031,7 @@ void NativeDecoder::generate(
         bool is_last = (i + 1 == prompt_tokens.size());
         forward_token(prompt_tokens[i], seq_pos, is_last, stream_slot, active_bitmask);
         seq_pos++;
-        if (seq_pos >= MAX_SEQ_LEN - 1) break;
+        if (seq_pos >= max_seq_len_ - 1) break;
     }
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -2031,7 +2043,7 @@ void NativeDecoder::generate(
 
     std::string accumulated_text;
 
-    while (generated_count < max_tokens && seq_pos < MAX_SEQ_LEN - 1) {
+    while (generated_count < max_tokens && seq_pos < max_seq_len_ - 1) {
         uint32_t next_token = sample_next_token(sampling, generated_tokens);
         float logit = h_top_logits_[0];
 
