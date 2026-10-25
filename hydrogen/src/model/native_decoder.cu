@@ -1067,6 +1067,80 @@ ToolCall parse_tool_call_json(const std::string& raw_json, uint32_t stream_id) {
         }
     }
 
+    // Fallback: Check for XML format <function=name> ... <parameter=key>value</parameter> ... </function>
+    if (result.name.empty()) {
+        size_t fn_pos = raw_json.find("<function=");
+        if (fn_pos != std::string::npos) {
+            size_t fn_start = fn_pos + 10;
+            size_t fn_end = raw_json.find('>', fn_start);
+            if (fn_end != std::string::npos) {
+                result.name = raw_json.substr(fn_start, fn_end - fn_start);
+                while (!result.name.empty() && (isspace(result.name.back()) || result.name.back() == '\r' || result.name.back() == '\n')) {
+                    result.name.pop_back();
+                }
+                while (!result.name.empty() && (isspace(result.name.front()) || result.name.front() == '\r' || result.name.front() == '\n')) {
+                    result.name.erase(0, 1);
+                }
+
+                std::string args_json = "{";
+                bool first_param = true;
+                size_t p_pos = fn_end + 1;
+                while ((p_pos = raw_json.find("<parameter=", p_pos)) != std::string::npos) {
+                    size_t p_name_start = p_pos + 11;
+                    size_t p_name_end = raw_json.find('>', p_name_start);
+                    if (p_name_end == std::string::npos) break;
+                    std::string p_name = raw_json.substr(p_name_start, p_name_end - p_name_start);
+
+                    size_t v_start = p_name_end + 1;
+                    size_t v_end = raw_json.find("</parameter>", v_start);
+                    if (v_end == std::string::npos) {
+                        v_end = raw_json.find("<parameter=", v_start);
+                        if (v_end == std::string::npos) {
+                            v_end = raw_json.find("</function>", v_start);
+                            if (v_end == std::string::npos) v_end = raw_json.size();
+                        }
+                    }
+                    std::string p_val = raw_json.substr(v_start, v_end - v_start);
+                    while (!p_val.empty() && (isspace(p_val.back()) || p_val.back() == '\r' || p_val.back() == '\n')) {
+                        p_val.pop_back();
+                    }
+                    while (!p_val.empty() && (isspace(p_val.front()) || p_val.front() == '\r' || p_val.front() == '\n')) {
+                        p_val.erase(0, 1);
+                    }
+
+                    if (!first_param) args_json += ", ";
+                    first_param = false;
+                    args_json += "\"" + p_name + "\": ";
+                    if (p_val == "true" || p_val == "false") {
+                        args_json += p_val;
+                    } else {
+                        bool is_num = !p_val.empty();
+                        for (char c : p_val) {
+                            if (!isdigit(c) && c != '-' && c != '.') { is_num = false; break; }
+                        }
+                        if (is_num) {
+                            args_json += p_val;
+                        } else {
+                            std::string escaped;
+                            for (char c : p_val) {
+                                if (c == '"') escaped += "\\\"";
+                                else if (c == '\\') escaped += "\\\\";
+                                else if (c == '\n') escaped += "\\n";
+                                else if (c == '\r') escaped += "\\r";
+                                else if (c == '\t') escaped += "\\t";
+                                else escaped += c;
+                            }
+                            args_json += "\"" + escaped + "\"";
+                        }
+                    }
+                    p_pos = v_end;
+                }
+                args_json += "}";
+                result.arguments = args_json;
+            }
+        }
+    }
+
     return result;
 }
 
