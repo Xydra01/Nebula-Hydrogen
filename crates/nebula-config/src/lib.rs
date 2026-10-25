@@ -414,18 +414,11 @@ const fn default_game_mode_cooldown_secs() -> u64 {
     10
 }
 fn default_game_mode_known_processes() -> Vec<String> {
-    vec![
-        "steam.exe".into(),
-        "steamservice.exe".into(),
-        "steamwebhelper.exe".into(),
-        "epicgameslauncher.exe".into(),
-        "battle.net.exe".into(),
-        "riotclientservices.exe".into(),
-        "galaxyclient.exe".into(),
-    ]
+    Vec::new()
 }
 fn default_game_mode_desktop_allowlist() -> Vec<String> {
     vec![
+        "dwm.exe".into(),
         "explorer.exe".into(),
         "cursor.exe".into(),
         "code.exe".into(),

@@ -219,3 +219,41 @@ command = ["New-Item", "ni", "mklink"]
 [rule.match.path]
 targets = "all-non-flag"
 destructive = false
+
+# ---------------------------------------------------------------------------
+# Workspace build & test toolchain whitelists -> Tier 1 (Sandbox)
+# (Protected Set Issue #71; anchored and path-verified by Issue #74)
+# ---------------------------------------------------------------------------
+
+# Safe in-worktree cargo commands (test, check, build, run, clippy, fmt):
+[[rule]]
+id = "build.cargo.confined"
+tier = 1
+[rule.match]
+command = ["cargo"]
+args_any = ["test", "check", "build", "run", "clippy", "fmt"]
+[rule.match.path]
+targets = "all-non-flag"
+destructive = false
+
+# Safe in-worktree cmake commands (configure, build):
+[[rule]]
+id = "build.cmake.confined"
+tier = 1
+[rule.match]
+command = ["cmake"]
+args_any = ["-B", "--build", "-S"]
+[rule.match.path]
+targets = "all-non-flag"
+destructive = false
+
+# Safe in-worktree ctest commands:
+[[rule]]
+id = "test.ctest.confined"
+tier = 1
+[rule.match]
+command = ["ctest"]
+[rule.match.path]
+targets = "all-non-flag"
+destructive = false
+

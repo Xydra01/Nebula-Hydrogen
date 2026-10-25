@@ -334,17 +334,10 @@ vram_threshold_mib = 2048
 # Resume cooldown in seconds after a game exits before reloading model and resuming tasks.
 cooldown_secs = 10
 # Known game processes or launcher executables.
-known_processes = [
-    "steam.exe",
-    "steamservice.exe",
-    "steamwebhelper.exe",
-    "epicgameslauncher.exe",
-    "battle.net.exe",
-    "riotclientservices.exe",
-    "galaxyclient.exe",
-]
+known_processes = []
 # Allowlist of normal desktop apps that should never trigger game mode.
 desktop_allowlist = [
+    "dwm.exe",
     "explorer.exe",
     "cursor.exe",
     "code.exe",

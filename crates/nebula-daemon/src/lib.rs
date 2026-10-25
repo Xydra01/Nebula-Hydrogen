@@ -248,6 +248,7 @@ pub fn start(config: NebulaConfig, deps: Deps) -> Result<Daemon, DaemonError> {
     });
 
     // Background monitor for game mode detection and GPU yielding
+    game_mode.set_language_registry(Arc::clone(&shared.languages));
     let gm = Arc::clone(&game_mode);
     let chat_gm = chat;
     let shared_for_gm = Arc::clone(&shared);
@@ -257,11 +258,13 @@ pub fn start(config: NebulaConfig, deps: Deps) -> Result<Daemon, DaemonError> {
         while !shared_for_gm.shutdown.is_cancelled() {
             tokio::select! {
                 _ = ticker.tick() => {
-                    let procs = shared_for_gm
-                        .latest_snapshot()
-                        .map(|s| s.gpu_processes)
+                    let snapshot = shared_for_gm.latest_snapshot();
+                    let procs = snapshot
+                        .as_ref()
+                        .map(|s| s.gpu_processes.clone())
                         .unwrap_or_default();
-                    gm.check_and_update(&chat_gm, &procs).await;
+                    let gpu_util = snapshot.and_then(|s| s.gpu_util_pct);
+                    gm.check_and_update(&chat_gm, &procs, gpu_util).await;
                 }
                 () = shared_for_gm.shutdown.cancelled() => break,
             }

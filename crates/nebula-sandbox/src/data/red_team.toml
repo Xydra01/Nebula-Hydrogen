@@ -248,6 +248,41 @@ command = "copy ..\\..\\secrets.env ."
 expected_tier = 3
 category = "path-tricks"
 
+[[entry]]
+command = "cargo test --manifest-path ../../Cargo.toml"
+expected_tier = 2
+category = "path-tricks"
+
+[[entry]]
+command = "cargo test --manifest-path=../../Cargo.toml"
+expected_tier = 2
+category = "path-tricks"
+
+[[entry]]
+command = "cmake -B C:\\evil"
+expected_tier = 3
+category = "path-tricks"
+
+[[entry]]
+command = "cmake -BC:\\evil"
+expected_tier = 3
+category = "path-tricks"
+
+[[entry]]
+command = "cargo test --manifest-path C:\\Windows\\Cargo.toml"
+expected_tier = 3
+category = "path-tricks"
+
+[[entry]]
+command = "cargo test"
+expected_tier = 1
+category = "path-tricks"
+
+[[entry]]
+command = "cmake --build ."
+expected_tier = 1
+category = "path-tricks"
+
 # --- chained ---------------------------------------------------------------------------
 
 [[entry]]

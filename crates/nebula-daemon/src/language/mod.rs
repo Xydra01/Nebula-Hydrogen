@@ -93,6 +93,12 @@ pub trait LanguageModule: Send + Sync {
 
     /// Run post-task verification (formatting, lockfile cleanup, final tests).
     async fn finalize(&self, ctx: &ProvisionContext<'_>) -> Result<FinalizeReport, LanguageError>;
+
+    /// Optional hook called when inference is paused (e.g. during Game Mode).
+    async fn on_pause(&self) {}
+
+    /// Optional hook called when inference resumes after pause.
+    async fn on_resume(&self) {}
 }
 
 /// Thread-safe registry of available language modules.
@@ -121,6 +127,34 @@ impl LanguageRegistry {
     pub fn register(&self, module: Arc<dyn LanguageModule>) {
         let mut lock = self.modules.write().unwrap_or_else(PoisonError::into_inner);
         lock.insert(module.id().to_string(), module);
+    }
+
+    /// Notify all registered modules that inference has been paused.
+    pub async fn on_pause(&self) {
+        let modules: Vec<Arc<dyn LanguageModule>> = self
+            .modules
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        for module in modules {
+            module.on_pause().await;
+        }
+    }
+
+    /// Notify all registered modules that inference has resumed.
+    pub async fn on_resume(&self) {
+        let modules: Vec<Arc<dyn LanguageModule>> = self
+            .modules
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        for module in modules {
+            module.on_resume().await;
+        }
     }
 
     /// Get a registered language module by ID.
