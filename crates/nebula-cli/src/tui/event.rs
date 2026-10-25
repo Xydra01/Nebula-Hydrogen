@@ -38,11 +38,30 @@ pub async fn run_tui(pipe_path: &str) -> Result<()> {
     }
 
     // Spawn background pipe event listener
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(512);
     tokio::spawn(async move {
         while let Ok(event) = event_client.next_event().await {
             if event_tx.send(event).await.is_err() {
                 break;
+            }
+        }
+    });
+
+    // Spawn background periodic resource poller
+    let (res_tx, mut res_rx) = tokio::sync::mpsc::channel(4);
+    let poll_pipe = pipe_path.to_string();
+    tokio::spawn(async move {
+        if let Ok(mut poll_client) = Client::connect(&poll_pipe, Duration::from_secs(5)).await {
+            let mut timer = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                timer.tick().await;
+                if let Ok(snap) = poll_client
+                    .call::<ResourceSnapshot>(Method::ResourcesSnapshot(Empty {}))
+                    .await
+                    && res_tx.send(snap).await.is_err()
+                {
+                    break;
+                }
             }
         }
     });
@@ -65,7 +84,6 @@ pub async fn run_tui(pipe_path: &str) -> Result<()> {
     let terminal = guard.terminal_mut();
 
     let mut tick_timer = tokio::time::interval(Duration::from_millis(50));
-    let mut poll_timer = tokio::time::interval(Duration::from_secs(2));
 
     loop {
         terminal.draw(|f| ui::render(&app, f))?;
@@ -74,13 +92,8 @@ pub async fn run_tui(pipe_path: &str) -> Result<()> {
             _ = tick_timer.tick() => {
                 // Periodic frame tick
             }
-            _ = poll_timer.tick() => {
-                if let Ok(snap) = cmd_client
-                    .call::<ResourceSnapshot>(Method::ResourcesSnapshot(Empty {}))
-                    .await
-                {
-                    app.update_resources(snap);
-                }
+            Some(snap) = res_rx.recv() => {
+                app.update_resources(snap);
             }
             Some(key) = key_rx.recv() => {
                 app.handle_key(key);

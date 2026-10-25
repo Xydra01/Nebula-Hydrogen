@@ -263,7 +263,8 @@ int main(int argc, char* argv[]) {
     std::string shm_name_str = get_env_var("NEBULA_HYDROGEN_SHM_NAME", "Local\\Nebula_Hydrogen_IPC");
     std::string eng_evt_str = get_env_var("NEBULA_HYDROGEN_ENGINE_EVENT", "Local\\Nebula_Hydrogen_IPC_EngineEvent");
     std::string dae_evt_str = get_env_var("NEBULA_HYDROGEN_DAEMON_EVENT", "Local\\Nebula_Hydrogen_IPC_DaemonEvent");
-    int ctx_len = 32768;
+    int ctx_len = 8192;
+    int max_streams = 4;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -273,7 +274,8 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: hydrogen_engine [options]\n"
                       << "  -m, --model <path>      Path to GGUF model file\n"
-                      << "  -c, --ctx <tokens>      Context size (default: 32768)\n"
+                      << "  -c, --ctx <tokens>      Context size (default: 8192)\n"
+                      << "  -s, --max-streams <num> Max concurrent streams (default: 4)\n"
                       << "  --shm-name <name>       Shared memory mapping name\n"
                       << "  --engine-event <name>   Engine event name\n"
                       << "  --daemon-event <name>   Daemon event name\n"
@@ -284,6 +286,8 @@ int main(int argc, char* argv[]) {
             model_path_str = argv[++i];
         } else if ((arg == "-c" || arg == "--ctx") && i + 1 < argc) {
             ctx_len = std::stoi(argv[++i]);
+        } else if ((arg == "-s" || arg == "--max-streams") && i + 1 < argc) {
+            max_streams = std::stoi(argv[++i]);
         } else if (arg == "--shm-name" && i + 1 < argc) {
             shm_name_str = argv[++i];
         } else if (arg == "--engine-event" && i + 1 < argc) {
@@ -300,6 +304,7 @@ int main(int argc, char* argv[]) {
               << "========================================================\n"
               << " Model:        " << model_path.string() << "\n"
               << " Context:      " << ctx_len << " tokens\n"
+              << " Max Streams:  " << max_streams << "\n"
               << " Shared Memory: " << shm_name_str << "\n"
               << " Engine Event: " << eng_evt_str << "\n"
               << " Daemon Event: " << dae_evt_str << "\n"
@@ -323,7 +328,11 @@ int main(int argc, char* argv[]) {
     if (!model_path.empty() && fs::exists(model_path)) {
         std::cout << "[Hydrogen] Initializing native autoregressive decoder from " << model_path.string() << "...\n" << std::flush;
         try {
-            decoder_ready = decoder.initialize(model_path);
+            decoder_ready = decoder.initialize(
+                model_path,
+                static_cast<uint32_t>(max_streams),
+                static_cast<uint32_t>(ctx_len)
+            );
             if (decoder_ready) {
                 std::cout << "[Hydrogen] NativeDecoder online (Vocab: " << decoder.vocab_size()
                           << ", Layers: " << decoder.layer_count()
@@ -456,7 +465,8 @@ int main(int argc, char* argv[]) {
                 }
             }
         } else if (req_hdr.msg_type == static_cast<uint16_t>(MessageType::MSG_RELEASE_STREAM)) {
-            uint32_t stream_slot = req_hdr.stream_id % 8;
+            uint32_t active_max_streams = decoder_ready ? decoder.max_streams() : static_cast<uint32_t>(max_streams);
+            uint32_t stream_slot = req_hdr.stream_id % active_max_streams;
             if (decoder_ready) {
                 decoder.release_stream_slot(stream_slot);
             }

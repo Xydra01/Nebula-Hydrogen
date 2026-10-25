@@ -221,6 +221,10 @@ Environment & Tools: \
 - System drives: The active repository/worktree is on drive F:. Never touch or reference drive C:. \
 - Available tools: Standard environment tools such as python, git, uv, cargo, and pytest are available in PATH. Run them directly without hardcoded absolute paths. \
 - Filesystem: Always use built-in tools (such as fs.list, fs.read, fs.write) to examine or modify files in the repository rather than shell commands like dir or cat. \
+TOOL CALL FORMAT: When invoking a tool, you MUST wrap your call in <tool_call> tags and format it as a JSON object with 'name' and 'arguments': \
+<tool_call> \
+{\"name\": \"tool_name\", \"arguments\": {\"param1\": \"val1\"}} \
+</tool_call> \
 EXECUTION RULE: Execute tool calls while work is in progress. Do NOT output conversational plans, status updates, or thoughts without tool calls. If you need to inspect files or run commands, invoke the tools directly. \
 EXIT DIRECTIVE: Once your verification and test commands pass with exit code 0 and satisfy the Definition of Done, the task is complete. You MUST immediately stop calling tools. Output your final completion summary in plain text without invoking any further tools to conclude the task.",
     );
@@ -793,6 +797,18 @@ async fn execute_loop(
                         "model token budget exhausted ({total_tokens_used} >= {})",
                         ctx.max_tokens
                     ),
+                );
+            }
+        }
+
+        // If the model finished without structured tool calls, extract from raw text (supports JSON and XML fallback)
+        if output.tool_calls.is_empty() {
+            output.tool_calls = extract_tool_calls_from_text(&output.text);
+            if !output.tool_calls.is_empty() {
+                tracing::info!(
+                    event = "task.tool_calls_extracted_from_text",
+                    count = output.tool_calls.len(),
+                    tools = ?output.tool_calls.iter().map(|c| &c.name).collect::<Vec<_>>()
                 );
             }
         }
@@ -1572,5 +1588,182 @@ pub(crate) async fn commit_worktree_if_dirty(
                 detail: format!("git commit failed to spawn: {e}"),
             })
         }
+    }
+}
+
+/// Extracts tool calls from unstructured text output if the model emits them as text.
+/// Supports both JSON `<tool_call>{"name": ..., "arguments": ...}</tool_call>` format
+/// and XML `<tool_call><function=...><parameter=...>...</function></tool_call>` format.
+pub(crate) fn extract_tool_calls_from_text(text: &str) -> Vec<nebula_model::ToolCall> {
+    let mut calls = Vec::new();
+    let mut search_from = 0;
+
+    while let Some(start_rel) = text[search_from..].find("<tool_call>") {
+        let start = search_from + start_rel + "<tool_call>".len();
+        let end = match text[start..].find("</tool_call>") {
+            Some(e) => start + e,
+            None => text.len(),
+        };
+        let body = text[start..end].trim();
+        search_from = if end < text.len() {
+            end + "</tool_call>".len()
+        } else {
+            text.len()
+        };
+
+        if let Some(call) = parse_single_tool_call_body(body, calls.len()) {
+            calls.push(call);
+        }
+    }
+
+    // Direct <function=...> fallback without <tool_call> wrapper
+    if calls.is_empty() {
+        let mut f_search = 0;
+        while let Some(start_rel) = text[f_search..].find("<function=") {
+            let start = f_search + start_rel;
+            let end = match text[start..].find("</function>") {
+                Some(e) => start + e + "</function>".len(),
+                None => text.len(),
+            };
+            let body = &text[start..end];
+            f_search = end;
+            if let Some(call) = parse_xml_function(body, calls.len()) {
+                calls.push(call);
+            }
+        }
+    }
+
+    calls
+}
+
+fn parse_single_tool_call_body(body: &str, index: usize) -> Option<nebula_model::ToolCall> {
+    let trimmed = body.trim();
+    if trimmed.starts_with('{')
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && let Some(name) = v.get("name").and_then(|n| n.as_str())
+    {
+        let arguments = match v.get("arguments") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(other) => other.to_string(),
+            None => "{}".to_string(),
+        };
+        return Some(nebula_model::ToolCall {
+            id: format!("call_extracted_{index}"),
+            name: name.to_string(),
+            arguments,
+        });
+    }
+
+    if trimmed.contains("<function=") {
+        return parse_xml_function(trimmed, index);
+    }
+
+    None
+}
+
+fn parse_xml_function(body: &str, index: usize) -> Option<nebula_model::ToolCall> {
+    let fn_start = body.find("<function=")?;
+    let after_fn = &body[fn_start + "<function=".len()..];
+    let fn_name_end = after_fn.find('>')?;
+    let name = after_fn[..fn_name_end].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+
+    let mut args_map = serde_json::Map::new();
+    let mut param_search = fn_start + "<function=".len() + fn_name_end + 1;
+
+    while let Some(p_start_rel) = body[param_search..].find("<parameter=") {
+        let p_start = param_search + p_start_rel + "<parameter=".len();
+        let after_p = &body[p_start..];
+        let Some(p_name_end) = after_p.find('>') else {
+            break;
+        };
+        let param_name = after_p[..p_name_end].trim().to_string();
+        let val_start = p_start + p_name_end + 1;
+        let next_close = body[val_start..].find("</parameter>");
+        let next_open = body[val_start..].find("<parameter=");
+        let next_fn_close = body[val_start..].find("</function>");
+
+        let mut ends = Vec::new();
+        if let Some(c) = next_close {
+            ends.push(val_start + c);
+        }
+        if let Some(o) = next_open {
+            ends.push(val_start + o);
+        }
+        if let Some(f) = next_fn_close {
+            ends.push(val_start + f);
+        }
+
+        let val_end = ends.into_iter().min().unwrap_or(body.len());
+        let param_val = body[val_start..val_end].trim();
+
+        let advance = if let Some(c) = next_close
+            && val_start + c == val_end
+        {
+            val_end + "</parameter>".len()
+        } else {
+            val_end
+        };
+        param_search = advance;
+
+        let json_val = if param_val == "true" {
+            serde_json::Value::Bool(true)
+        } else if param_val == "false" {
+            serde_json::Value::Bool(false)
+        } else if let Ok(n) = param_val.parse::<i64>() {
+            serde_json::Value::Number(n.into())
+        } else if let Ok(f) = param_val.parse::<f64>() {
+            serde_json::Number::from_f64(f)
+                .map(serde_json::Value::Number)
+                .unwrap_or_else(|| serde_json::Value::String(param_val.to_string()))
+        } else {
+            serde_json::Value::String(param_val.to_string())
+        };
+
+        args_map.insert(param_name, json_val);
+    }
+
+    Some(nebula_model::ToolCall {
+        id: format!("call_extracted_{index}"),
+        name,
+        arguments: serde_json::Value::Object(args_map).to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_tool_calls_from_json_tool_call() {
+        let text = "I will read the file now.\n<tool_call>\n{\"name\": \"fs.read\", \"arguments\": {\"path\": \"src/main.rs\"}}\n</tool_call>";
+        let calls = extract_tool_calls_from_text(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "fs.read");
+        let args: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(args["path"], "src/main.rs");
+    }
+
+    #[test]
+    fn test_extract_tool_calls_from_xml_tool_call() {
+        let text = "<think>\nThinking about listing files\n</think>\n\n<tool_call>\n<function=fs.list>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>";
+        let calls = extract_tool_calls_from_text(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "fs.list");
+        let args: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(args["path"], ".");
+    }
+
+    #[test]
+    fn test_extract_tool_calls_multiple_parameters_xml() {
+        let text = "<tool_call>\n<function=fs.list>\n<parameter=path>\n.\n<parameter=recursive>\nfalse\n</parameter>\n</function>\n</tool_call>";
+        let calls = extract_tool_calls_from_text(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "fs.list");
+        let args: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(args["path"], ".");
+        assert_eq!(args["recursive"], false);
     }
 }

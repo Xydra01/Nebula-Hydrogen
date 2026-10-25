@@ -90,8 +90,11 @@ ToolCall parse_tool_call_json(const std::string& raw_json, uint32_t stream_id);
 
 class NativeDecoder {
 public:
-    static constexpr uint32_t MAX_STREAMS = 8;
-    static constexpr uint32_t MAX_SEQ_LEN = 8192;
+    static constexpr uint32_t DEFAULT_MAX_STREAMS = 4;
+    static constexpr uint32_t DEFAULT_MAX_SEQ_LEN = 8192;
+
+    static constexpr uint32_t MAX_STREAMS = DEFAULT_MAX_STREAMS;
+    static constexpr uint32_t MAX_SEQ_LEN = DEFAULT_MAX_SEQ_LEN;
 
     using TokenCallback = std::function<bool(uint32_t token_id, float logit, const std::string& text, bool is_final)>;
     using ToolCallCallback = std::function<bool(const ToolCall& tool_call)>;
@@ -100,7 +103,11 @@ public:
     ~NativeDecoder();
 
     // Initialize decoder, allocate VRAM, load weights and pre-allocate activation buffers
-    bool initialize(const std::filesystem::path& model_path);
+    bool initialize(
+        const std::filesystem::path& model_path,
+        uint32_t max_streams = DEFAULT_MAX_STREAMS,
+        uint32_t max_seq_len = DEFAULT_MAX_SEQ_LEN
+    );
 
     // Autoregressively generate tokens with streaming callback and optional tool call detection
     void generate(
@@ -162,8 +169,10 @@ public:
     [[nodiscard]] uint32_t vocab_size() const noexcept { return vocab_size_; }
     [[nodiscard]] uint32_t layer_count() const noexcept { return layer_count_; }
     [[nodiscard]] uint32_t embedding_dim() const noexcept { return embedding_dim_; }
-    [[nodiscard]] uint32_t current_seq_pos(uint32_t stream_slot) const noexcept {
-        return (stream_slot < MAX_STREAMS) ? stream_seq_pos_[stream_slot] : 0;
+    [[nodiscard]] uint32_t max_streams() const noexcept { return max_streams_; }
+    [[nodiscard]] uint32_t max_seq_len() const noexcept { return max_seq_len_; }
+    [[nodiscard]] uint32_t current_seq_pos(uint32_t stream_slot = 0) const noexcept {
+        return (stream_slot < max_streams_) ? stream_seq_pos_[stream_slot] : 0;
     }
 
     // Dynamic Radix Page Pool KV Binding (Issue H21 / H15)
@@ -248,16 +257,19 @@ private:
     float* d_ffn_out_ = nullptr;       // [5120]
     float* d_logits_ = nullptr;        // [248320]
 
+    uint32_t max_streams_ = DEFAULT_MAX_STREAMS;
+    uint32_t max_seq_len_ = DEFAULT_MAX_SEQ_LEN;
+
     // Multi-Stream KV Cache & SSM States
-    float* d_k_cache_ = nullptr;       // [MAX_STREAMS * 16 * MAX_SEQ_LEN * 4 * 256]
-    float* d_v_cache_ = nullptr;       // [MAX_STREAMS * 16 * MAX_SEQ_LEN * 4 * 256]
-    float* d_ssm_state_ = nullptr;     // [MAX_STREAMS * 48 layers * 48 heads * 128 * 128 (Gated DeltaNet matrix memory)]
-    float* d_ssm_conv_state_ = nullptr;// [MAX_STREAMS * 48 * 4 * 10240]
+    float* d_k_cache_ = nullptr;       // [max_streams_ * 16 * max_seq_len_ * 4 * 256]
+    float* d_v_cache_ = nullptr;       // [max_streams_ * 16 * max_seq_len_ * 4 * 256]
+    float* d_ssm_state_ = nullptr;     // [max_streams_ * 48 layers * 48 heads * 128 * 128 (Gated DeltaNet matrix memory)]
+    float* d_ssm_conv_state_ = nullptr;// [max_streams_ * 48 * 4 * 10240]
     float* d_conv_out_ = nullptr;      // [10240]
     float* d_decay_ = nullptr;         // [48]
     float* d_beta_ = nullptr;          // [48]
     float* d_attn_core_ = nullptr;     // [6144]
-    uint32_t stream_seq_pos_[MAX_STREAMS] = {0};
+    std::vector<uint32_t> stream_seq_pos_;
 
     // Grammar Mask Buffer (Device)
     uint32_t* d_grammar_mask_ = nullptr; // [(vocab_size + 31) / 32]
@@ -270,8 +282,8 @@ private:
     float* d_dynamic_paged_k_ = nullptr;
     float* d_dynamic_paged_v_ = nullptr;
     std::vector<uint32_t> h_stream_block_table_;
-    std::vector<uint32_t> stream_allocated_pages_[MAX_STREAMS];
-    std::shared_ptr<RadixTreeNode> stream_radix_nodes_[MAX_STREAMS];
+    std::vector<std::vector<uint32_t>> stream_allocated_pages_;
+    std::vector<std::shared_ptr<RadixTreeNode>> stream_radix_nodes_;
 
     // Dynamic FSM Tool Grammar State (Zero PCIe copy per step)
     std::shared_ptr<grammar::FsmCompiledTable> active_fsm_table_;

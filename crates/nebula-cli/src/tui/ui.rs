@@ -127,6 +127,17 @@ fn render_header(app: &TuiApp, frame: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(")"),
+        Span::raw(" | Streams: "),
+        Span::styled(
+            format!("{}/{}", app.active_streams(), app.max_streams()),
+            Style::default()
+                .fg(if app.active_streams() > 0 {
+                    Color::Cyan
+                } else {
+                    Color::DarkGray
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" | Lang: "),
         Span::styled(lang_str, Style::default().fg(Color::Green)),
         Span::styled(" [MCP: OK]", Style::default().fg(Color::DarkGray)),
@@ -225,6 +236,15 @@ fn render_resources(app: &TuiApp, frame: &mut Frame, area: Rect) {
         ),
         Span::raw("  |  Commit: "),
         Span::styled(commit_str, Style::default().fg(commit_color)),
+        Span::raw("  |  Streams: "),
+        Span::styled(
+            format!("{}/{} active", app.active_streams(), app.max_streams()),
+            Style::default().fg(if app.active_streams() > 0 {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            }),
+        ),
         Span::raw("  |  GPU: "),
         Span::styled(gpu_util_str, Style::default().fg(Color::Cyan)),
         Span::raw("  |  CPU: "),
@@ -246,8 +266,8 @@ fn render_main_body(app: &TuiApp, frame: &mut Frame, area: Rect) {
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(40), // Left: Tasks & Tools
-            Constraint::Percentage(60), // Right: Streaming Output
+            Constraint::Percentage(45), // Left: Tasks & Tools
+            Constraint::Percentage(55), // Right: Streaming Output
         ])
         .split(area);
 
@@ -283,13 +303,13 @@ fn render_tasks_pane(app: &TuiApp, frame: &mut Frame, area: Rect) {
             .enumerate()
             .map(|(i, task)| {
                 let (status_badge, status_color) = match task.status {
-                    crate::tui::TuiTaskStatus::Running => ("[RUNNING]", Color::Cyan),
-                    crate::tui::TuiTaskStatus::Completed => ("[COMPLETED]", Color::Green),
-                    crate::tui::TuiTaskStatus::Finished => ("[FINISHED]", Color::Green),
-                    crate::tui::TuiTaskStatus::Failed => ("[FAILED]", Color::Red),
-                    crate::tui::TuiTaskStatus::LimitReached => ("[CEILING]", Color::Yellow),
-                    crate::tui::TuiTaskStatus::Committing => ("[COMMITTING]", Color::Magenta),
-                    crate::tui::TuiTaskStatus::Cancelled => ("[CANCELLED]", Color::DarkGray),
+                    crate::tui::TuiTaskStatus::Running => ("[RUN]", Color::Cyan),
+                    crate::tui::TuiTaskStatus::Completed => ("[DONE]", Color::Green),
+                    crate::tui::TuiTaskStatus::Finished => ("[FIN]", Color::Green),
+                    crate::tui::TuiTaskStatus::Failed => ("[FAIL]", Color::Red),
+                    crate::tui::TuiTaskStatus::LimitReached => ("[LIMIT]", Color::Yellow),
+                    crate::tui::TuiTaskStatus::Committing => ("[COMMIT]", Color::Magenta),
+                    crate::tui::TuiTaskStatus::Cancelled => ("[CANC]", Color::DarkGray),
                 };
 
                 let selected = i == app.selected_task;
@@ -308,9 +328,16 @@ fn render_tasks_pane(app: &TuiApp, frame: &mut Frame, area: Rect) {
                     ));
                 }
 
+                let id_str = task.id.to_string();
+                let short_id = if id_str.len() > 8 {
+                    &id_str[..8]
+                } else {
+                    &id_str
+                };
+
                 spans.extend(vec![
                     Span::styled(
-                        format!("{:.8}..", task.id),
+                        format!("{short_id}.."),
                         Style::default()
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD),
@@ -332,6 +359,12 @@ fn render_tasks_pane(app: &TuiApp, frame: &mut Frame, area: Rect) {
             .collect()
     };
 
+    let tasks_title = format!(
+        " Tasks (Tab: 1) [Streams: {}/{} active] ",
+        app.active_streams(),
+        app.max_streams()
+    );
+
     let tasks_list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
@@ -341,7 +374,7 @@ fn render_tasks_pane(app: &TuiApp, frame: &mut Frame, area: Rect) {
                 BorderType::Rounded
             })
             .border_style(Style::default().fg(border_color))
-            .title(" Tasks (Tab: 1) "),
+            .title(tasks_title),
     );
 
     frame.render_widget(tasks_list, area);
@@ -356,7 +389,14 @@ fn render_tools_pane(app: &TuiApp, frame: &mut Frame, area: Rect) {
     };
 
     let rows: Vec<Row> = if app.tool_calls.is_empty() {
-        vec![Row::new(vec![Cell::from("No recent tool calls")])]
+        vec![Row::new(vec![
+            Cell::from("-"),
+            Cell::from(Span::styled(
+                "No recent tool calls",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Cell::from("-"),
+        ])]
     } else {
         app.tool_calls
             .iter()
@@ -436,7 +476,11 @@ fn render_streaming_pane(app: &TuiApp, frame: &mut Frame, area: Rect) {
     let total_visual_lines: usize = text_content
         .split('\n')
         .map(|l| {
-            let len = l.chars().count();
+            let len = if l.is_ascii() {
+                l.len()
+            } else {
+                l.chars().count()
+            };
             if len == 0 {
                 1
             } else {
