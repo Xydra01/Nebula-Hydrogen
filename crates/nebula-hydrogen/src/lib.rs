@@ -14,9 +14,10 @@ mod ipc;
 
 #[cfg(windows)]
 pub use ipc::{
-    FRAME_HEADER_SIZE, FrameFlags, IpcError, IpcFrameHeader, MessageType, ShmGlobalHeader,
-    ShmHandle, ShmQueueHeader, TokenPayload, ToolSpawnGuard, register_global_shm,
-    tool_process_completed, tool_process_spawned, unregister_global_shm,
+    FRAME_HEADER_SIZE, FrameFlags, GENERATE_TOKENS_REQUEST_SIZE, GenerateTokensRequest, IpcError,
+    IpcFrameHeader, MessageType, ShmGlobalHeader, ShmHandle, ShmQueueHeader, StreamLeaseGuard,
+    TokenPayload, ToolSpawnGuard, register_global_shm, tool_process_completed,
+    tool_process_spawned, unregister_global_shm,
 };
 
 /// IPC protocol magic: `"HYDR"` (0x4859_4452).

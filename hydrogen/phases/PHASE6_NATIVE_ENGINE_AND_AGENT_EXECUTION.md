@@ -53,13 +53,19 @@ By the end of **Phase 6**:
 
 Phase 6 must strictly enforce the following four architectural requirements:
 
-1. **SSM Stream Isolation Invariant**:
-   Ternary Bonsai-2 27B contains 48 State Space Model (SSM) recurrent layers. Unlike self-attention where tokens are keyed by position in a page table, SSMs maintain a continuous recurrent hidden state. In the multi-stream batcher, the SSM state buffer must be strictly indexed by `stream_slot * (48 * ssm_inner)`. Concurrent agent streams must never read or write across another stream's SSM slot.
-2. **Dual-Mode Tokenizer Invariant**:
+1. **SSM Stream Isolation & Mathematical Completeness Invariant**:
+   Ternary Bonsai-2 27B contains 48 State Space Model (SSM) recurrent layers. Unlike self-attention where tokens are keyed by position in a page table, SSMs maintain a continuous recurrent hidden state. In the multi-stream batcher, the SSM state buffer must be strictly indexed by `stream_slot * (48 * ssm_inner)`. Concurrent agent streams must never read or write across another stream's SSM slot. Furthermore, the decoder MUST implement the full mathematically exact recurrence: 1D causal depthwise convolution (`ssm_conv1d`), time-step projection ($\Delta t$), discretized state transition $A$, input projection $B$, output projection $C$, group norm (`ssm_norm`), QK RMSNorm (`attn_q_norm`, `attn_k_norm`), and Rotary Position Embeddings (RoPE). Toy recurrence stubs are strictly forbidden.
+2. **Unified Multi-Stream Batched GEMM Invariant ($M=B$)**:
+   The engine MUST NOT execute serial GEMV passes across concurrent streams (which takes $44.25\text{ ms} \times B$ per step). Multi-stream scheduling must assemble tokens into a unified batched GEMM ($M = B$) across all active streams in a single kernel dispatch, amortizing weight reading bandwidth across all streams to guarantee per-step execution time $T_{\text{step}} \le 16.0\text{ ms}$ ($\ge 500\text{ tokens/s}$ aggregate).
+3. **Marlin Dequantization Tile Saturation Invariant**:
+   To counteract memory bandwidth roll-off at higher batch sizes ($522.5\text{ GB/s}$ at $M=1$ dropping to $201.7\text{ GB/s}$ at $M=8$ due to register pressure and bank conflicts), the GEMM kernel must configure $128 \times 128$ macro-tiles with 2-stage double-buffered shared memory staging, sustaining $\ge 70\%$ bus saturation at $M=8$.
+4. **Empirical Desktop PCIe Swap Budget**:
+   Host memory swapping budgets must anchor to physical desktop PCIe link negotiation ($13.0\text{ ms}$ leaf eviction at $12.0\text{ GB/s}$) rather than theoretical Gen 4 line rates ($6.1\text{ ms}$), with cancellation barriers bounded by `MAX_SWAP_LATENCY_CEILING_PCIE3_MS` ($15.0\text{ ms}$).
+5. **Dual-Mode Tokenizer Invariant**:
    The GGUF tokenizer must check for `tokenizer.ggml.merges`. If present, it executes rank-based BPE pair merges. If absent, it must fall back to dynamic programming maximum-scoring byte-fallback SentencePiece, translating unmapped bytes to `<0x00>`...`<0xFF>` tokens. ChatML control tokens (`<|im_start|>`, `<|im_end|>`, `<tool_call>`, `</tool_call>`) must be parsed as indivisible atomic tokens.
-3. **Radix Prefix Sharing Mathematical Invariant**:
+6. **Radix Prefix Sharing Mathematical Invariant**:
    On the RTX 4070 (12 GB VRAM), static weights consume 5.95 GB and context scratchpads consume 480 MB, leaving 5.85 GB for KV cache. Without prefix deduplication, 8 concurrent tasks with 8K context require $8 \times 8,192 \times 160\text{ KiB} = 10,240\text{ MB}$, causing an instant OOM crash. With Radix prefix deduplication sharing the 4K-token system and tool prompt, 8 streams require $4,096 \times 80\text{ KiB} + 8 \times 2,048 \times 80\text{ KiB} = 1,638.4\text{ MB}$ (only 28% of the pool). Radix tree sharing is mandatory.
-4. **WDDM TDR Prefill Clamping Invariant**:
+7. **WDDM TDR Prefill Clamping Invariant**:
    Windows Display Driver Model enforces a 2,000 ms execution quantum (`TdrDelay`). Processing large tool observations ($>2,000$ tokens) in an unchunked GEMM pass risks triggering a driver reset. All prefills are strictly clamped to $M \le 64$ tokens per continuous step ($t_{\text{compute}} \approx 9.76\text{ ms} < 14.08\text{ ms}$), guaranteeing zero UI stutter and a $>130\times$ safety margin below the WDDM TDR ceiling.
 
 ---

@@ -48,8 +48,15 @@ int main(int argc, char* argv[]) {
               << "--------------------------------------------------------\n"
               << std::flush;
 
-    // Test Tokenizer in isolation
     std::string test_prompt = "<|im_start|>user\nHello! What is 2 + 2?<|im_end|>\n<|im_start|>assistant\n<think>\n";
+    if (argc > 2) {
+        std::string user_input = argv[2];
+        if (user_input.find("<|im_start|>") == std::string::npos) {
+            test_prompt = "<|im_start|>user\n" + user_input + "<|im_end|>\n<|im_start|>assistant\n<think>\n";
+        } else {
+            test_prompt = user_input;
+        }
+    }
     std::vector<uint32_t> tokens = decoder.tokenizer().encode(test_prompt);
     if (tokens.empty()) {
         std::cerr << "[FAIL] Tokenizer returned empty token sequence for test prompt.\n";

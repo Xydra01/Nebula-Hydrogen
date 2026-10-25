@@ -220,6 +220,92 @@ int main(int argc, char* argv[]) {
             throw std::runtime_error("Zero-copy token stream data corruption or out-of-order sequence detected");
         }
 
+        // ====================================================================
+        // STEP 5: Stream Lease Registry & Atomic CAS Verification (H21-B)
+        // ====================================================================
+        std::vector<int32_t> leased_slots;
+        for (int i = 0; i < 8; ++i) {
+            int32_t slot = client.acquire_stream_slot();
+            if (slot != i) {
+                throw std::runtime_error("Expected stream slot " + std::to_string(i) + " but got " + std::to_string(slot));
+            }
+            if (!client.is_slot_active(static_cast<uint32_t>(slot))) {
+                throw std::runtime_error("Acquired slot " + std::to_string(slot) + " not marked active");
+            }
+            leased_slots.push_back(slot);
+        }
+
+        // Slot 8 should fail (exhaustion)
+        int32_t overflow_slot = client.acquire_stream_slot();
+        if (overflow_slot != -1) {
+            throw std::runtime_error("Expected slot exhaustion (-1) but got " + std::to_string(overflow_slot));
+        }
+
+        // Release slot 4 and re-acquire
+        client.release_stream_slot(4);
+        if (client.is_slot_active(4)) {
+            throw std::runtime_error("Released slot 4 still marked active");
+        }
+        int32_t reacquired = client.acquire_stream_slot();
+        if (reacquired != 4) {
+            throw std::runtime_error("Expected re-acquisition of slot 4, got " + std::to_string(reacquired));
+        }
+
+        // Release all slots
+        for (int32_t s : leased_slots) {
+            client.release_stream_slot(static_cast<uint32_t>(s));
+        }
+
+        // Churn test: 100 iterations of rapid acquire/release
+        for (int iter = 0; iter < 100; ++iter) {
+            int32_t s = client.acquire_stream_slot();
+            if (s < 0 || s >= 8) {
+                throw std::runtime_error("Churn acquire failed on iteration " + std::to_string(iter));
+            }
+            client.release_stream_slot(static_cast<uint32_t>(s));
+        }
+
+        // ====================================================================
+        // STEP 6: Zero-Copy Binary Token Request Framing (16,384 tokens) (H21-B)
+        // ====================================================================
+        constexpr uint32_t NUM_BINARY_TOKENS = 16384;
+        std::vector<uint32_t> sample_tokens(NUM_BINARY_TOKENS);
+        for (uint32_t i = 0; i < NUM_BINARY_TOKENS; ++i) {
+            sample_tokens[i] = (i * 17 + 101) % 151669;
+        }
+
+        const auto t_binary_start = std::chrono::steady_clock::now();
+        uint32_t stop_tok = 248046;
+        if (!client.send_generate_tokens_request(
+                2, sample_tokens.data(), NUM_BINARY_TOKENS, 128, 0.7f, 0.8f, &stop_tok, 1)) {
+            throw std::runtime_error("Failed to write binary token request frame");
+        }
+
+        // Server receives and ingests pre-tokenized payload
+        IpcFrameHeader bin_hdr;
+        std::vector<uint8_t> bin_payload(sizeof(GenerateTokensRequest) + NUM_BINARY_TOKENS * sizeof(uint32_t) + 64);
+        if (!server.poll_request(bin_hdr, bin_payload.data(), bin_payload.size())) {
+            throw std::runtime_error("Server failed to poll binary token request");
+        }
+        const auto t_binary_end = std::chrono::steady_clock::now();
+        const double binary_ingestion_us = std::chrono::duration<double, std::micro>(t_binary_end - t_binary_start).count();
+
+        if (bin_hdr.msg_type != static_cast<uint16_t>(MessageType::MSG_GENERATE_TOKENS_REQUEST)) {
+            throw std::runtime_error("Unexpected message type for binary token request: " + std::to_string(bin_hdr.msg_type));
+        }
+
+        const auto* parsed_req = reinterpret_cast<const GenerateTokensRequest*>(bin_payload.data());
+        if (parsed_req->num_tokens != NUM_BINARY_TOKENS || parsed_req->stream_id != 2) {
+            throw std::runtime_error("Binary token request header mismatch");
+        }
+
+        const auto* parsed_tokens = reinterpret_cast<const uint32_t*>(bin_payload.data() + sizeof(GenerateTokensRequest));
+        for (uint32_t i = 0; i < NUM_BINARY_TOKENS; ++i) {
+            if (parsed_tokens[i] != sample_tokens[i]) {
+                throw std::runtime_error("Binary token corruption at index " + std::to_string(i));
+            }
+        }
+
         const double tokens_per_sec = static_cast<double>(stream_tokens) / (stream_duration_s > 0 ? stream_duration_s : 0.001);
         const double http_baseline_latency_us = 4500.0; // 4.5 ms HTTP loopback baseline
         const double speedup_vs_http = http_baseline_latency_us / p50_latency_us;
@@ -234,7 +320,7 @@ int main(int argc, char* argv[]) {
         if (json_output) {
             std::cout << std::fixed << std::setprecision(3);
             std::cout << "{\n"
-                      << "  \"benchmark\": \"H16_win32_shared_memory_ipc\",\n"
+                      << "  \"benchmark\": \"H16_H21B_win32_shared_memory_ipc\",\n"
                       << "  \"status\": \"PASS\",\n"
                       << "  \"shm_total_capacity_bytes\": " << SHM_TOTAL_CAPACITY_BYTES << ",\n"
                       << "  \"request_queue_capacity_bytes\": " << REQUEST_QUEUE_CAPACITY_BYTES << ",\n"
@@ -261,11 +347,23 @@ int main(int argc, char* argv[]) {
                       << "    \"zero_corrupted_frames\": true,\n"
                       << "    \"passed\": true\n"
                       << "  },\n"
+                      << "  \"stream_lease_benchmark\": {\n"
+                      << "    \"slots_tested\": 8,\n"
+                      << "    \"exhaustion_enforced\": true,\n"
+                      << "    \"churn_iterations\": 100,\n"
+                      << "    \"passed\": true\n"
+                      << "  },\n"
+                      << "  \"binary_token_ingestion\": {\n"
+                      << "    \"tokens_ingested\": " << NUM_BINARY_TOKENS << ",\n"
+                      << "    \"latency_us\": " << binary_ingestion_us << ",\n"
+                      << "    \"zero_corruption\": true,\n"
+                      << "    \"passed\": true\n"
+                      << "  },\n"
                       << "  \"all_criteria_met\": true\n"
                       << "}\n";
         } else {
             std::cout << "\n===================================================================\n";
-            std::cout << " HYDROGEN H16: WIN32 SHARED MEMORY IPC PROTOCOL BENCHMARK\n";
+            std::cout << " HYDROGEN H16/H21-B: WIN32 SHM IPC & STREAM-LEASE REGISTRY BENCHMARK\n";
             std::cout << "===================================================================\n\n";
 
             std::cout << "[Shared Memory Geometry]\n";
@@ -298,8 +396,20 @@ int main(int argc, char* argv[]) {
             std::cout << "  - Win32 Handle Cleanup          : ZERO LEAKS\n";
             std::cout << "  - Test 3 Status                 : PASS\n\n";
 
+            std::cout << "[Test 4: Stream Lease Registry & Atomic CAS Churn]\n";
+            std::cout << "  - Slots Tested                  : 8 Concurrent Stream Slots (0..7)\n";
+            std::cout << "  - Slot Exhaustion Enforcement   : VERIFIED (Slot 8 rejected with -1)\n";
+            std::cout << "  - Atomic CAS Churn Iterations   : 100 successful acquire/release cycles\n";
+            std::cout << "  - Test 4 Status                 : PASS\n\n";
+
+            std::cout << "[Test 5: Zero-Copy Binary Token Ingestion (H21-B)]\n";
+            std::cout << "  - Tokens Ingested               : " << NUM_BINARY_TOKENS << " pre-tokenized uint32_t IDs\n";
+            std::cout << "  - Total Ingestion Latency       : " << binary_ingestion_us << " us (" << (binary_ingestion_us / 1000.0) << " ms)\n";
+            std::cout << "  - Data Integrity                : 100% Bit-Exact Match (Zero Corruption)\n";
+            std::cout << "  - Test 5 Status                 : PASS\n\n";
+
             std::cout << "===================================================================\n";
-            std::cout << " ALL ACCEPTANCE CRITERIA MET (H16)\n";
+            std::cout << " ALL ACCEPTANCE CRITERIA MET (H16 + H21-B)\n";
             std::cout << "===================================================================\n\n";
         }
 

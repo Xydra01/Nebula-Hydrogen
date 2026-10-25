@@ -128,13 +128,22 @@ int main(int argc, char* argv[]) {
                       << "Metadata Entries (" << model.metadata.size() << "):\n";
             for (const auto& [k, v] : model.metadata) {
                 if (v.type == hydrogen::GGUFType::ARRAY) {
-                    std::cout << "  " << k << " = [ARRAY len=" << v.as_array().size() << "]\n";
+                    std::cout << "  " << k << " = [";
+                    const auto& arr = v.as_array();
+                    for (size_t i = 0; i < arr.size(); ++i) {
+                        std::cout << (i > 0 ? ", " : "") << arr[i].as_uint64();
+                    }
+                    std::cout << "]\n";
                 } else if (v.type == hydrogen::GGUFType::STRING) {
                     std::string s = v.as_string();
                     if (s.size() > 60) s = s.substr(0, 57) + "...";
                     std::cout << "  " << k << " = \"" << s << "\"\n";
+                } else if (v.type == hydrogen::GGUFType::FLOAT32 || v.type == hydrogen::GGUFType::FLOAT64) {
+                    std::cout << "  " << k << " = " << v.as_float() << "\n";
+                } else if (v.type == hydrogen::GGUFType::BOOL) {
+                    std::cout << "  " << k << " = " << (v.as_bool() ? "true" : "false") << "\n";
                 } else {
-                    std::cout << "  " << k << " = " << v.as_string() << "\n";
+                    std::cout << "  " << k << " = " << v.as_uint64() << "\n";
                 }
             }
 

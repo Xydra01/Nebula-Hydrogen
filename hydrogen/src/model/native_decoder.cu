@@ -28,6 +28,13 @@ namespace hydrogen {
 
 namespace {
 
+// TQ1_0 PrismML block definition (256 elements in 56 bytes, 8-byte aligned)
+struct BlockTQ1_0 {
+    uint16_t d;         // delta (fp16)
+    uint8_t packed[52]; // packed base-3 trits
+    uint16_t _pad;      // 8-byte alignment padding (total 56 bytes)
+};
+
 // Warp-level sum reduction using shuffle intrinsics
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     #pragma unroll
@@ -134,8 +141,32 @@ __global__ void kernel_hadamard_inverse(
 }
 
 // ----------------------------------------------------------------------------
-// Embedding Lookup Kernel (PTQ1_0 Dual 28-byte Sub-Block Layout)
+// Embedding Lookup Kernel (Exact PrismML PTQ1_0 28-byte Dual Sub-block Layout)
 // ----------------------------------------------------------------------------
+__device__ __forceinline__ int decode_ptq1_0_trit(uint32_t in_sub, const uint8_t* sub_bytes) {
+    if (in_sub < 80) {
+        uint32_t p_idx = in_sub >> 4;   // in_sub / 16
+        uint32_t j = in_sub & 15;       // in_sub % 16
+        uint32_t p = (p_idx == 0) ? 1 : (p_idx == 1) ? 3 : (p_idx == 2) ? 9 : (p_idx == 3) ? 27 : 81;
+        uint32_t b = sub_bytes[j];
+        return static_cast<int>(((b * p) & 0xff) * 3 >> 8) - 1;
+    } else if (in_sub < 120) {
+        uint32_t rem = in_sub - 80;
+        uint32_t p_idx = rem >> 3;      // rem / 8
+        uint32_t j = 16 + (rem & 7);    // 16 + (rem % 8)
+        uint32_t p = (p_idx == 0) ? 1 : (p_idx == 1) ? 3 : (p_idx == 2) ? 9 : (p_idx == 3) ? 27 : 81;
+        uint32_t b = sub_bytes[j];
+        return static_cast<int>(((b * p) & 0xff) * 3 >> 8) - 1;
+    } else {
+        uint32_t rem = in_sub - 120;
+        uint32_t p_idx = rem >> 1;      // rem / 2
+        uint32_t byte_sel = rem & 1;    // rem % 2
+        uint32_t p = (p_idx == 0) ? 1 : (p_idx == 1) ? 3 : (p_idx == 2) ? 9 : 27;
+        uint32_t b = sub_bytes[24 + byte_sel];
+        return static_cast<int>(((b * p) & 0xff) * 3 >> 8) - 1;
+    }
+}
+
 __global__ void kernel_embedding_lookup(
     const uint8_t* __restrict__ embd_data,
     uint32_t token_id,
@@ -146,37 +177,18 @@ __global__ void kernel_embedding_lookup(
     if (tid >= embedding_dim) return;
 
     uint32_t block_idx = tid / 256;
-    uint32_t in_block_idx = tid % 256;
+    uint32_t in_block = tid % 256;
+    uint32_t sub_idx = in_block / 128;
+    uint32_t in_sub = in_block % 128;
     uint32_t blocks_per_row = embedding_dim / 256;
     uint64_t global_block_idx = static_cast<uint64_t>(token_id) * blocks_per_row + block_idx;
 
-    const uint8_t* blk_ptr = embd_data + (global_block_idx * 56);
-    uint32_t sub = in_block_idx / 128;
-    const uint8_t* sub_ptr = blk_ptr + (sub * 28);
-    float scale = __half2float(*reinterpret_cast<const __half*>(sub_ptr + 26));
-    if (isnan(scale) || isinf(scale)) scale = 0.0f;
+    const uint8_t* sub_bytes = embd_data + global_block_idx * 56 + sub_idx * 28;
+    float d = __half2float(*reinterpret_cast<const __half*>(sub_bytes + 26));
+    if (isnan(d) || isinf(d)) d = 0.0f;
 
-    uint32_t idx = in_block_idx % 128;
-    uint32_t r, b;
-    if (idx < 80) {
-        r = idx / 16;
-        b = idx % 16;
-    } else if (idx < 120) {
-        uint32_t rem = idx - 80;
-        r = rem / 8;
-        b = 16 + (rem % 8);
-    } else {
-        uint32_t rem = idx - 120;
-        r = rem / 2;
-        b = 24 + (rem % 2);
-    }
-
-    uint8_t byte_val = sub_ptr[b];
-    static const uint32_t pow3[5] = {1, 3, 9, 27, 81};
-    uint32_t val = (static_cast<uint32_t>(byte_val) * pow3[r]) & 0xFF;
-    int trit = static_cast<int>((val * 3) >> 8) - 1;
-
-    d_out[tid] = scale * static_cast<float>(trit);
+    int trit = decode_ptq1_0_trit(in_sub, sub_bytes);
+    d_out[tid] = d * static_cast<float>(trit);
 }
 
 // ----------------------------------------------------------------------------
@@ -222,12 +234,13 @@ __global__ void kernel_rmsnorm(
     float scale = s_warp_sums[0];
 
     for (uint32_t i = tid; i < dim; i += blockDim.x) {
-        d_out[i] = d_x[i] * scale * d_weight[i];
+        float w = (d_weight != nullptr) ? d_weight[i] : 1.0f;
+        d_out[i] = d_x[i] * scale * w;
     }
 }
 
 // ----------------------------------------------------------------------------
-// Matrix-Vector Multiplication for PTQ1_0 Weights (Dual 28-byte Sub-Blocks)
+// Matrix-Vector Multiplication for GGUF TQ1_0 Weights (Exact PTQ1_0)
 // ----------------------------------------------------------------------------
 __global__ void kernel_gemv_tq1_0(
     const float* __restrict__ d_x,
@@ -236,111 +249,41 @@ __global__ void kernel_gemv_tq1_0(
     uint32_t in_dim,
     uint32_t out_dim
 ) {
-    uint32_t row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
-    if (row >= out_dim) return;
+    uint32_t warp_global_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    if (warp_global_id >= out_dim) return;
 
     uint32_t lane = threadIdx.x % 32;
     uint32_t blocks_per_row = in_dim / 256;
-    const uint8_t* row_blocks = d_weight + (static_cast<uint64_t>(row) * blocks_per_row * 56);
+    const uint8_t* row_bytes = d_weight + static_cast<uint64_t>(warp_global_id) * blocks_per_row * 56;
 
-    float sum = 0.0f;
-    static const uint32_t pow3[5] = {1, 3, 9, 27, 81};
+    float acc = 0.0f;
 
-    for (uint32_t b = lane; b < blocks_per_row; b += 32) {
-        const uint8_t* blk_ptr = row_blocks + (static_cast<size_t>(b) * 56);
-        const float* x_ptr = d_x + (b * 256);
+    for (uint32_t b = 0; b < blocks_per_row; ++b) {
+        const uint8_t* blk = row_bytes + b * 56;
+        uint32_t blk_base = b * 256;
 
-        // Sub-block 0 (elements 0..127)
-        float d0 = __half2float(*reinterpret_cast<const __half*>(blk_ptr + 26));
-        if (!isnan(d0) && !isinf(d0) && d0 != 0.0f) {
-            float sub_sum0 = 0.0f;
-            #pragma unroll
-            for (uint32_t r = 0; r < 5; ++r) {
-                uint32_t p3 = pow3[r];
-                uint32_t base_k = r * 16;
-                #pragma unroll 16
-                for (uint32_t j = 0; j < 16; ++j) {
-                    uint32_t val = (static_cast<uint32_t>(blk_ptr[j]) * p3) & 0xFF;
-                    int trit = static_cast<int>((val * 3) >> 8) - 1;
-                    sub_sum0 += static_cast<float>(trit) * x_ptr[base_k + j];
-                }
-            }
-            #pragma unroll
-            for (uint32_t r = 0; r < 5; ++r) {
-                uint32_t p3 = pow3[r];
-                uint32_t base_k = 80 + r * 8;
-                #pragma unroll 8
-                for (uint32_t j = 0; j < 8; ++j) {
-                    uint32_t val = (static_cast<uint32_t>(blk_ptr[16 + j]) * p3) & 0xFF;
-                    int trit = static_cast<int>((val * 3) >> 8) - 1;
-                    sub_sum0 += static_cast<float>(trit) * x_ptr[base_k + j];
-                }
-            }
-            uint32_t b24 = blk_ptr[24];
-            uint32_t b25 = blk_ptr[25];
-            #pragma unroll
-            for (uint32_t r = 0; r < 4; ++r) {
-                uint32_t p3 = pow3[r];
-                uint32_t val24 = (b24 * p3) & 0xFF;
-                int t24 = static_cast<int>((val24 * 3) >> 8) - 1;
-                sub_sum0 += static_cast<float>(t24) * x_ptr[120 + r * 2];
+        #pragma unroll
+        for (uint32_t sub = 0; sub < 2; ++sub) {
+            const uint8_t* sub_bytes = blk + sub * 28;
+            float d = __half2float(*reinterpret_cast<const __half*>(sub_bytes + 26));
+            if (isnan(d) || isinf(d)) d = 0.0f;
+            uint32_t sub_base = blk_base + sub * 128;
 
-                uint32_t val25 = (b25 * p3) & 0xFF;
-                int t25 = static_cast<int>((val25 * 3) >> 8) - 1;
-                sub_sum0 += static_cast<float>(t25) * x_ptr[120 + r * 2 + 1];
+            float lane_acc = 0.0f;
+            #pragma unroll
+            for (uint32_t k = 0; k < 4; ++k) {
+                uint32_t in_sub = lane * 4 + k;
+                int trit = decode_ptq1_0_trit(in_sub, sub_bytes);
+                lane_acc += static_cast<float>(trit) * d_x[sub_base + in_sub];
             }
-            sum += d0 * sub_sum0;
-        }
 
-        // Sub-block 1 (elements 128..255)
-        const uint8_t* blk1_ptr = blk_ptr + 28;
-        const float* x1_ptr = x_ptr + 128;
-        float d1 = __half2float(*reinterpret_cast<const __half*>(blk1_ptr + 26));
-        if (!isnan(d1) && !isinf(d1) && d1 != 0.0f) {
-            float sub_sum1 = 0.0f;
-            #pragma unroll
-            for (uint32_t r = 0; r < 5; ++r) {
-                uint32_t p3 = pow3[r];
-                uint32_t base_k = r * 16;
-                #pragma unroll 16
-                for (uint32_t j = 0; j < 16; ++j) {
-                    uint32_t val = (static_cast<uint32_t>(blk1_ptr[j]) * p3) & 0xFF;
-                    int trit = static_cast<int>((val * 3) >> 8) - 1;
-                    sub_sum1 += static_cast<float>(trit) * x1_ptr[base_k + j];
-                }
-            }
-            #pragma unroll
-            for (uint32_t r = 0; r < 5; ++r) {
-                uint32_t p3 = pow3[r];
-                uint32_t base_k = 80 + r * 8;
-                #pragma unroll 8
-                for (uint32_t j = 0; j < 8; ++j) {
-                    uint32_t val = (static_cast<uint32_t>(blk1_ptr[16 + j]) * p3) & 0xFF;
-                    int trit = static_cast<int>((val * 3) >> 8) - 1;
-                    sub_sum1 += static_cast<float>(trit) * x1_ptr[base_k + j];
-                }
-            }
-            uint32_t b24 = blk1_ptr[24];
-            uint32_t b25 = blk1_ptr[25];
-            #pragma unroll
-            for (uint32_t r = 0; r < 4; ++r) {
-                uint32_t p3 = pow3[r];
-                uint32_t val24 = (b24 * p3) & 0xFF;
-                int t24 = static_cast<int>((val24 * 3) >> 8) - 1;
-                sub_sum1 += static_cast<float>(t24) * x1_ptr[120 + r * 2];
-
-                uint32_t val25 = (b25 * p3) & 0xFF;
-                int t25 = static_cast<int>((val25 * 3) >> 8) - 1;
-                sub_sum1 += static_cast<float>(t25) * x1_ptr[120 + r * 2 + 1];
-            }
-            sum += d1 * sub_sum1;
+            lane_acc = warp_reduce_sum(lane_acc);
+            acc += d * lane_acc;
         }
     }
 
-    sum = warp_reduce_sum(sum);
-
     if (lane == 0) {
-        d_out[row] = sum;
+        d_out[warp_global_id] = acc;
     }
 }
 
@@ -377,25 +320,96 @@ __global__ void kernel_swiglu(
 }
 
 // ----------------------------------------------------------------------------
-// Split & Gate Query Kernel
 // ----------------------------------------------------------------------------
-__global__ void kernel_split_and_gate_query(
-    const float* __restrict__ d_q_raw,
-    float* __restrict__ d_q_out,
+// Attention Output Sigmoid Gate Kernel (Qwen 3.5 Gated Attention)
+// ----------------------------------------------------------------------------
+__global__ void kernel_gate_attention_output(
+    float* __restrict__ d_out,
+    const float* __restrict__ d_gate,
     uint32_t num_elements
 ) {
     uint32_t idx = blockDim.x * blockIdx.x + threadIdx.x;
     if (idx < num_elements) {
-        float q1 = d_q_raw[idx];
-        float q2 = d_q_raw[num_elements + idx];
-        float gate = 1.0f / (1.0f + expf(-q2));
-        d_q_out[idx] = q1 * gate;
+        float g = d_gate[idx];
+        float sig = 1.0f / (1.0f + expf(-g));
+        d_out[idx] = d_out[idx] * sig;
     }
 }
 
 // ----------------------------------------------------------------------------
-// Causal Self-Attention Decoding Kernel (GQA 24:4 heads, head_dim 256)
 // ----------------------------------------------------------------------------
+// Deinterleave Q and Gate Kernel (24 heads * 512 -> Q: 24*256, Gate: 24*256)
+// ----------------------------------------------------------------------------
+__global__ void kernel_deinterleave_q_gate(
+    const float* __restrict__ d_q_raw,   // [12288]
+    float* __restrict__ d_q_heads,       // [6144]
+    float* __restrict__ d_attn_gate      // [6144]
+) {
+    uint32_t head = blockIdx.x; // 0..23
+    uint32_t tid = threadIdx.x; // 0..255
+
+    uint32_t raw_offset = head * 512;
+    uint32_t out_offset = head * 256;
+
+    d_q_heads[out_offset + tid]   = d_q_raw[raw_offset + tid];
+    d_attn_gate[out_offset + tid] = d_q_raw[raw_offset + 256 + tid];
+}
+
+// ----------------------------------------------------------------------------
+// Per-Head QK-RMSNorm and Rotary Position Embeddings (RoPE) Kernel (NEOX pairing)
+// ----------------------------------------------------------------------------
+__global__ void kernel_apply_qk_norm_and_rope(
+    float* __restrict__ d_q,           // [num_q_heads * head_dim] = [24 * 256]
+    float* __restrict__ d_k,           // [num_kv_heads * head_dim] = [4 * 256]
+    const float* __restrict__ q_norm,  // [head_dim] = [256]
+    const float* __restrict__ k_norm,  // [head_dim] = [256]
+    uint32_t num_q_heads,              // 24
+    uint32_t num_kv_heads,             // 4
+    uint32_t head_dim,                 // 256
+    uint32_t rope_dim,                 // 64
+    float freq_base,                   // 10000000.0f
+    uint32_t pos
+) {
+    uint32_t head_idx = blockIdx.x; // 0..27 (0..23 is Q, 24..27 is K)
+    uint32_t tid = threadIdx.x;     // 0..31
+
+    bool is_q = (head_idx < num_q_heads);
+    float* vec = is_q ? (d_q + head_idx * head_dim) 
+                      : (d_k + (head_idx - num_q_heads) * head_dim);
+    const float* norm_scale = is_q ? q_norm : k_norm;
+
+    // 1. Compute RMS of head vector (32 threads handle 8 elements each = 256)
+    float sum_sq = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        float val = vec[tid + k * 32];
+        sum_sq += val * val;
+    }
+    sum_sq = warp_reduce_sum(sum_sq);
+    float head_sum = __shfl_sync(0xffffffff, sum_sq, 0);
+    float inv_rms = rsqrtf((head_sum / static_cast<float>(head_dim)) + 1e-6f);
+
+    // Apply norm scaling
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        uint32_t d = tid + k * 32;
+        float w = norm_scale ? norm_scale[d] : 1.0f;
+        vec[d] = vec[d] * inv_rms * w;
+    }
+
+    // 2. Apply NEOX RoPE to first rope_dim (64) elements: pair (tid, tid + 32)
+    if (tid < 32) {
+        float freq = powf(freq_base, -static_cast<float>(2 * tid) / static_cast<float>(rope_dim));
+        float angle = static_cast<float>(pos) * freq;
+        float cos_a = cosf(angle);
+        float sin_a = sinf(angle);
+        float v0 = vec[tid];
+        float v1 = vec[tid + 32];
+        vec[tid]      = v0 * cos_a - v1 * sin_a;
+        vec[tid + 32] = v0 * sin_a + v1 * cos_a;
+    }
+}
+
 // ----------------------------------------------------------------------------
 // Causal Self-Attention Decoding Kernel (GQA 24:4 heads, head_dim 256, multi-stream)
 // ----------------------------------------------------------------------------
@@ -424,53 +438,107 @@ __global__ void kernel_attention_decode(
     if (q_head >= num_q_heads) return;
 
     uint32_t kv_head = q_head / (num_q_heads / num_kv_heads);
-    uint32_t tid = threadIdx.x;
+    uint32_t tid = threadIdx.x; // 0..31
+
+    const float* q_vec = d_q + (q_head * head_dim);
+    float q_scale = 1.0f / sqrtf(static_cast<float>(head_dim)); // 1 / 16 = 0.0625f
 
     if (is_paged_enabled && d_block_table && d_paged_k && d_paged_v) {
-        // Paged Radix KV Cache Path (Dynamic Scaling to 32K/262K context)
+        // Paged Radix KV Cache Path
         uint32_t write_block = pos / block_size;
         uint32_t write_offset = pos % block_size;
         uint32_t write_page = d_block_table[stream_slot * max_blocks_per_stream + write_block];
         size_t page_stride = static_cast<size_t>(block_size) * num_kv_heads * head_dim;
-        size_t total_page_stride = 16ULL * page_stride; // 16 full-attention layers in 64-layer Bonsai-2 27B
+        size_t total_page_stride = 16ULL * page_stride;
         size_t write_kv_off = static_cast<size_t>(write_page) * total_page_stride +
                               static_cast<size_t>(attn_layer_idx) * page_stride +
                               static_cast<size_t>(write_offset) * num_kv_heads * head_dim +
                               static_cast<size_t>(kv_head) * head_dim;
 
-        for (uint32_t i = tid; i < head_dim; i += blockDim.x) {
-            d_paged_k[write_kv_off + i] = d_k_new[kv_head * head_dim + i];
-            d_paged_v[write_kv_off + i] = d_v_new[kv_head * head_dim + i];
+        // Write new K and V (only 1 query head per KV group writes to prevent redundancy)
+        if (q_head % (num_q_heads / num_kv_heads) == 0) {
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                uint32_t d = tid + k * 32;
+                d_paged_k[write_kv_off + d] = d_k_new[kv_head * head_dim + d];
+                d_paged_v[write_kv_off + d] = d_v_new[kv_head * head_dim + d];
+            }
         }
-        __syncthreads();
+        // Write new K and V asynchronously (head 0 of KV group)
+        if (q_head % (num_q_heads / num_kv_heads) == 0) {
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                uint32_t d = tid + k * 32;
+                d_paged_k[write_kv_off + d] = d_k_new[kv_head * head_dim + d];
+                d_paged_v[write_kv_off + d] = d_v_new[kv_head * head_dim + d];
+            }
+        }
 
-        const float* q_vec = d_q + (q_head * head_dim);
-        float q_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+        // Numerically stable Online Softmax across all positions 0..pos
+        float m_prev = -1e20f;
+        float l_prev = 0.0f;
+        float o_acc[8] = {0.0f};
 
-        float max_score = -1e20f;
         for (uint32_t p = 0; p <= pos; ++p) {
-            uint32_t p_block = p / block_size;
-            uint32_t p_offset = p % block_size;
-            uint32_t p_page = d_block_table[stream_slot * max_blocks_per_stream + p_block];
-            size_t k_offset = static_cast<size_t>(p_page) * total_page_stride +
-                              static_cast<size_t>(attn_layer_idx) * page_stride +
-                              static_cast<size_t>(p_offset) * num_kv_heads * head_dim +
-                              static_cast<size_t>(kv_head) * head_dim;
-            const float* k_vec = d_paged_k + k_offset;
-
-            float score = 0.0f;
-            for (uint32_t i = tid; i < head_dim; i += blockDim.x) {
-                score += q_vec[i] * k_vec[i];
+            float dot = 0.0f;
+            if (p == pos) {
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    uint32_t d = tid + k * 32;
+                    dot += q_vec[d] * d_k_new[kv_head * head_dim + d];
+                }
+            } else {
+                uint32_t p_block = p / block_size;
+                uint32_t p_offset = p % block_size;
+                uint32_t p_page = d_block_table[stream_slot * max_blocks_per_stream + p_block];
+                size_t k_offset = static_cast<size_t>(p_page) * total_page_stride +
+                                  static_cast<size_t>(attn_layer_idx) * page_stride +
+                                  static_cast<size_t>(p_offset) * num_kv_heads * head_dim +
+                                  static_cast<size_t>(kv_head) * head_dim;
+                const float* k_vec = d_paged_k + k_offset;
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    uint32_t d = tid + k * 32;
+                    dot += q_vec[d] * k_vec[d];
+                }
             }
-            score = warp_reduce_sum(score);
-            if (tid == 0) {
-                score *= q_scale;
-                if (score > max_score) max_score = score;
+            dot = warp_reduce_sum(dot) * q_scale;
+            float score_p = __shfl_sync(0xffffffff, dot, 0);
+
+            float m_curr = fmaxf(m_prev, score_p);
+            float alpha = expf(m_prev - m_curr);
+            float beta = expf(score_p - m_curr);
+            l_prev = alpha * l_prev + beta;
+            m_prev = m_curr;
+
+            if (p == pos) {
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    uint32_t d = tid + k * 32;
+                    o_acc[k] = alpha * o_acc[k] + beta * d_v_new[kv_head * head_dim + d];
+                }
+            } else {
+                uint32_t p_block = p / block_size;
+                uint32_t p_offset = p % block_size;
+                uint32_t p_page = d_block_table[stream_slot * max_blocks_per_stream + p_block];
+                size_t v_offset = static_cast<size_t>(p_page) * total_page_stride +
+                                  static_cast<size_t>(attn_layer_idx) * page_stride +
+                                  static_cast<size_t>(p_offset) * num_kv_heads * head_dim +
+                                  static_cast<size_t>(kv_head) * head_dim;
+                const float* v_vec = d_paged_v + v_offset;
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    uint32_t d = tid + k * 32;
+                    o_acc[k] = alpha * o_acc[k] + beta * v_vec[d];
+                }
             }
         }
 
-        for (uint32_t i = tid; i < head_dim; i += blockDim.x) {
-            d_out[q_head * head_dim + i] = d_paged_v[write_kv_off + i];
+        float inv_l = (l_prev > 0.0f) ? (1.0f / l_prev) : 1.0f;
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            uint32_t d = tid + k * 32;
+            d_out[q_head * head_dim + d] = o_acc[k] * inv_l;
         }
     } else {
         // Contiguous Static KV Cache Path
@@ -483,72 +551,372 @@ __global__ void kernel_attention_decode(
                                static_cast<size_t>(pos) * num_kv_heads * head_dim +
                                static_cast<size_t>(kv_head) * head_dim;
 
-        for (uint32_t i = tid; i < head_dim; i += blockDim.x) {
-            d_k_cache[pos_kv_offset + i] = d_k_new[kv_head * head_dim + i];
-            d_v_cache[pos_kv_offset + i] = d_v_new[kv_head * head_dim + i];
+        // Write new K and V asynchronously (head 0 of KV group)
+        if (q_head % (num_q_heads / num_kv_heads) == 0) {
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                uint32_t d = tid + k * 32;
+                d_k_cache[pos_kv_offset + d] = d_k_new[kv_head * head_dim + d];
+                d_v_cache[pos_kv_offset + d] = d_v_new[kv_head * head_dim + d];
+            }
         }
-        __syncthreads();
 
-        const float* q_vec = d_q + (q_head * head_dim);
-        float q_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+        // Numerically stable Online Softmax across all positions 0..pos
+        float m_prev = -1e20f;
+        float l_prev = 0.0f;
+        float o_acc[8] = {0.0f};
 
-        float max_score = -1e20f;
         for (uint32_t p = 0; p <= pos; ++p) {
-            size_t k_offset = stream_base +
-                              static_cast<size_t>(attn_layer_idx) * layer_kv_stride +
-                              static_cast<size_t>(p) * num_kv_heads * head_dim +
-                              static_cast<size_t>(kv_head) * head_dim;
-            const float* k_vec = d_k_cache + k_offset;
-
-            float score = 0.0f;
-            for (uint32_t i = tid; i < head_dim; i += blockDim.x) {
-                score += q_vec[i] * k_vec[i];
+            float dot = 0.0f;
+            if (p == pos) {
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    uint32_t d = tid + k * 32;
+                    dot += q_vec[d] * d_k_new[kv_head * head_dim + d];
+                }
+            } else {
+                size_t k_offset = stream_base +
+                                  static_cast<size_t>(attn_layer_idx) * layer_kv_stride +
+                                  static_cast<size_t>(p) * num_kv_heads * head_dim +
+                                  static_cast<size_t>(kv_head) * head_dim;
+                const float* k_vec = d_k_cache + k_offset;
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    uint32_t d = tid + k * 32;
+                    dot += q_vec[d] * k_vec[d];
+                }
             }
-            score = warp_reduce_sum(score);
-            if (tid == 0) {
-                score *= q_scale;
-                if (score > max_score) max_score = score;
+            dot = warp_reduce_sum(dot) * q_scale;
+            float score_p = __shfl_sync(0xffffffff, dot, 0);
+
+            float m_curr = fmaxf(m_prev, score_p);
+            float alpha = expf(m_prev - m_curr);
+            float beta = expf(score_p - m_curr);
+            l_prev = alpha * l_prev + beta;
+            m_prev = m_curr;
+
+            if (p == pos) {
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    uint32_t d = tid + k * 32;
+                    o_acc[k] = alpha * o_acc[k] + beta * d_v_new[kv_head * head_dim + d];
+                }
+            } else {
+                size_t v_offset = stream_base +
+                                  static_cast<size_t>(attn_layer_idx) * layer_kv_stride +
+                                  static_cast<size_t>(p) * num_kv_heads * head_dim +
+                                  static_cast<size_t>(kv_head) * head_dim;
+                const float* v_vec = d_v_cache + v_offset;
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    uint32_t d = tid + k * 32;
+                    o_acc[k] = alpha * o_acc[k] + beta * v_vec[d];
+                }
             }
         }
 
-        for (uint32_t i = tid; i < head_dim; i += blockDim.x) {
-            size_t v_offset = stream_base +
-                              static_cast<size_t>(attn_layer_idx) * layer_kv_stride +
-                              static_cast<size_t>(pos) * num_kv_heads * head_dim +
-                              static_cast<size_t>(kv_head) * head_dim;
-            d_out[q_head * head_dim + i] = d_v_cache[v_offset + i];
+        float inv_l = (l_prev > 0.0f) ? (1.0f / l_prev) : 1.0f;
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            uint32_t d = tid + k * 32;
+            d_out[q_head * head_dim + d] = o_acc[k] * inv_l;
         }
     }
 }
 
 // ----------------------------------------------------------------------------
-// SSM Linear Recurrence Step Kernel (Multi-Stream)
+// SSM 1D Causal Depthwise Convolution Kernel (10,240 channels, K=4, Multi-Stream)
 // ----------------------------------------------------------------------------
-__global__ void kernel_ssm_step(
+__global__ void kernel_ssm_conv1d_step(
     const float* __restrict__ d_qkv,
-    const float* __restrict__ d_gate,
-    float* __restrict__ d_ssm_state,
-    float* __restrict__ d_out,
+    const float* __restrict__ d_ssm_conv1d,
+    float* __restrict__ d_ssm_conv_state,
+    float* __restrict__ d_conv_out,
     uint32_t layer_idx,
-    uint32_t inner_dim,
     uint32_t stream_slot
 ) {
-    uint32_t idx = blockDim.x * blockIdx.x + threadIdx.x;
-    if (idx >= inner_dim) return;
+    uint32_t c = blockDim.x * blockIdx.x + threadIdx.x;
+    if (c >= 10240) return;
 
-    size_t state_offset = (static_cast<size_t>(stream_slot) * 48ULL + layer_idx) * inner_dim + idx;
+    size_t state_base = (static_cast<size_t>(stream_slot) * 48ULL + layer_idx) * (4ULL * 10240ULL) + c;
 
-    float u = d_qkv[idx];
-    float prev_s = d_ssm_state[state_offset];
+    // Shift history buffer and push new input
+    float h0 = d_ssm_conv_state[state_base + 1 * 10240];
+    float h1 = d_ssm_conv_state[state_base + 2 * 10240];
+    float h2 = d_ssm_conv_state[state_base + 3 * 10240];
+    float h3 = d_qkv[c];
 
-    // Leaky linear recurrence step
-    float new_s = prev_s * 0.95f + u * 0.05f;
-    d_ssm_state[state_offset] = new_s;
+    d_ssm_conv_state[state_base + 0 * 10240] = h0;
+    d_ssm_conv_state[state_base + 1 * 10240] = h1;
+    d_ssm_conv_state[state_base + 2 * 10240] = h2;
+    d_ssm_conv_state[state_base + 3 * 10240] = h3;
 
-    float g = d_gate[idx];
-    float silu_g = g / (1.0f + expf(-g));
+    if (d_ssm_conv1d != nullptr) {
+        // GGUF tensor shape [4, 10240] has ne[0] = 4, so weights for channel c are at c * 4 + k
+        float w0 = d_ssm_conv1d[c * 4 + 0];
+        float w1 = d_ssm_conv1d[c * 4 + 1];
+        float w2 = d_ssm_conv1d[c * 4 + 2];
+        float w3 = d_ssm_conv1d[c * 4 + 3];
 
-    d_out[idx] = (new_s + u) * silu_g;
+        float conv_val = w0 * h0 + w1 * h1 + w2 * h2 + w3 * h3;
+        // SiLU non-linearity: x * sigmoid(x)
+        d_conv_out[c] = conv_val / (1.0f + expf(-conv_val));
+    } else {
+        d_conv_out[c] = h3;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Gated DeltaNet L2 Normalization Kernel (16 Key & Query heads of dim 128)
+// ----------------------------------------------------------------------------
+__global__ void kernel_deltanet_l2_norm(
+    float* __restrict__ d_q, // [16 * 128]
+    float* __restrict__ d_k  // [16 * 128]
+) {
+    uint32_t head_idx = blockIdx.x; // 0..15
+    if (head_idx >= 16) return;
+
+    float* q_head = d_q + head_idx * 128;
+    float* k_head = d_k + head_idx * 128;
+
+    float q_sq = 0.0f;
+    float k_sq = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        uint32_t idx = threadIdx.x + j * 32;
+        float q_val = q_head[idx];
+        float k_val = k_head[idx];
+        q_sq += q_val * q_val;
+        k_sq += k_val * k_val;
+    }
+
+    q_sq = warp_reduce_sum(q_sq);
+    k_sq = warp_reduce_sum(k_sq);
+
+    float q_inv = rsqrtf(__shfl_sync(0xffffffff, q_sq, 0) + 1e-6f);
+    float k_inv = rsqrtf(__shfl_sync(0xffffffff, k_sq, 0) + 1e-6f);
+
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        uint32_t idx = threadIdx.x + j * 32;
+        q_head[idx] *= q_inv;
+        k_head[idx] *= k_inv;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Gated DeltaNet Dynamic Alpha/Beta Projections and Decay Kernel (48 heads)
+// ----------------------------------------------------------------------------
+__global__ void kernel_deltanet_alpha_beta_step(
+    const float* __restrict__ d_x_norm,      // [5120]
+    const void* __restrict__ ssm_alpha,      // [48, 5120] (BF16)
+    const void* __restrict__ ssm_beta,       // [48, 5120] (BF16)
+    const float* __restrict__ ssm_dt,        // [48]
+    const float* __restrict__ ssm_a,         // [48]
+    float* __restrict__ d_decay,             // [48]
+    float* __restrict__ d_beta               // [48]
+) {
+    uint32_t head = blockIdx.x; // 0..47
+    if (head >= 48) return;
+
+    uint32_t tid = threadIdx.x; // 0..127
+    float acc_alpha = 0.0f;
+    float acc_beta = 0.0f;
+
+    const uint16_t* w_alpha = ssm_alpha ? (reinterpret_cast<const uint16_t*>(ssm_alpha) + head * 5120) : nullptr;
+    const uint16_t* w_beta  = ssm_beta  ? (reinterpret_cast<const uint16_t*>(ssm_beta)  + head * 5120) : nullptr;
+
+    if (w_alpha && w_beta) {
+        for (uint32_t j = tid; j < 5120; j += blockDim.x) {
+            float x_val = d_x_norm[j];
+            uint32_t u_a = static_cast<uint32_t>(w_alpha[j]) << 16;
+            uint32_t u_b = static_cast<uint32_t>(w_beta[j]) << 16;
+            acc_alpha += x_val * (*reinterpret_cast<const float*>(&u_a));
+            acc_beta  += x_val * (*reinterpret_cast<const float*>(&u_b));
+        }
+    }
+
+    acc_alpha = warp_reduce_sum(acc_alpha);
+    acc_beta  = warp_reduce_sum(acc_beta);
+
+    __shared__ float s_alpha[4];
+    __shared__ float s_beta[4];
+    uint32_t warp_id = tid / 32;
+    uint32_t lane = tid % 32;
+
+    if (lane == 0) {
+        s_alpha[warp_id] = acc_alpha;
+        s_beta[warp_id] = acc_beta;
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float tot_alpha = (lane < 4) ? s_alpha[lane] : 0.0f;
+        float tot_beta  = (lane < 4) ? s_beta[lane]  : 0.0f;
+        tot_alpha = warp_reduce_sum(tot_alpha);
+        tot_beta  = warp_reduce_sum(tot_beta);
+
+        if (lane == 0) {
+            float dt = ssm_dt ? ssm_dt[head] : 0.0f;
+            float alpha_biased = tot_alpha + dt;
+            float alpha_softplus = (alpha_biased > 20.0f) ? alpha_biased : log1pf(expf(alpha_biased));
+            float a_val = ssm_a ? ssm_a[head] : -1.0f;
+            float gate = alpha_softplus * a_val;
+            d_decay[head] = expf(gate);
+
+            // beta_sigmoid
+            d_beta[head] = 1.0f / (1.0f + expf(-tot_beta));
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Gated DeltaNet Fast Register-Blocked Column Recurrence Kernel (48 heads x 128 cols)
+// ----------------------------------------------------------------------------
+__global__ void kernel_deltanet_recurrence_fast(
+    const float* __restrict__ d_conv_q,      // [16 * 128] = [2048]
+    const float* __restrict__ d_conv_k,      // [16 * 128] = [2048]
+    const float* __restrict__ d_conv_v,      // [48 * 128] = [6144]
+    const float* __restrict__ d_decay,       // [48]
+    const float* __restrict__ d_beta,        // [48]
+    float* __restrict__ d_ssm_state,         // [MAX_STREAMS * 48 * 48 * 16384]
+    float* __restrict__ d_attn_core,         // [6144]
+    uint32_t ssm_layer_idx,
+    uint32_t stream_slot
+) {
+    uint32_t head = blockIdx.x; // 0..47
+    if (head >= 48) return;
+
+    // 8 blocks per head, each block handles 16 columns (16 * 8 = 128 columns)
+    uint32_t block_col_base = blockIdx.y * 16;
+
+    uint32_t warp_id = threadIdx.x / 32; // 0..3
+    uint32_t lane = threadIdx.x % 32;    // 0..31
+    uint32_t col_in_warp = lane / 8;     // 0..3
+    uint32_t lane_in_col = lane % 8;     // 0..7
+
+    uint32_t col = block_col_base + warp_id * 4 + col_in_warp;
+    if (col >= 128) return;
+
+    uint32_t qk_head = head % 16;
+    const float* q = d_conv_q + qk_head * 128;
+    const float* k = d_conv_k + qk_head * 128;
+    const float* v = d_conv_v + head * 128;
+
+    size_t state_stride = 48ULL * 48ULL * 16384ULL;
+    size_t head_offset = static_cast<size_t>(stream_slot) * state_stride +
+                         static_cast<size_t>(ssm_layer_idx) * (48ULL * 16384ULL) +
+                         static_cast<size_t>(head) * 16384ULL;
+    float* S = d_ssm_state + head_offset;
+
+    float g_val = d_decay[head];
+    float beta_val = d_beta[head];
+
+    float s_shard[16];
+    float k_reg[16];
+    float q_reg[16];
+
+    #pragma unroll
+    for (int r = 0; r < 16; ++r) {
+        int row = r * 8 + lane_in_col;
+        s_shard[r] = S[col * 128 + row];
+        k_reg[r] = k[row];
+        q_reg[r] = q[row];
+    }
+
+    // kv[col] = sum_row S[row, col] * k[row]
+    float kv_shard = 0.0f;
+    #pragma unroll
+    for (int r = 0; r < 16; ++r) {
+        kv_shard += s_shard[r] * k_reg[r];
+    }
+    // 8-lane reduction
+    for (int offset = 4; offset > 0; offset /= 2) {
+        kv_shard += __shfl_down_sync(0xffffffff, kv_shard, offset);
+    }
+    float kv_col = __shfl_sync(0xffffffff, kv_shard, (lane & ~7));
+
+    // delta[col] = (v[col] - g_val * kv_col) * beta_val
+    float delta_col = (v[col] - g_val * kv_col) * beta_val;
+
+    // S[row, col] = g_val * S[row, col] + k[row] * delta_col
+    // attn[col] = sum_row S[row, col] * q[row]
+    float attn_partial = 0.0f;
+    #pragma unroll
+    for (int r = 0; r < 16; ++r) {
+        s_shard[r] = g_val * s_shard[r] + k_reg[r] * delta_col;
+        attn_partial += s_shard[r] * q_reg[r];
+    }
+    for (int offset = 4; offset > 0; offset /= 2) {
+        attn_partial += __shfl_down_sync(0xffffffff, attn_partial, offset);
+    }
+
+    if (lane_in_col == 0) {
+        // scale = 1 / sqrt(128)
+        constexpr float scale = 0.08838834764831845f;
+        d_attn_core[head * 128 + col] = attn_partial * scale;
+    }
+
+    // Write updated state back
+    #pragma unroll
+    for (int r = 0; r < 16; ++r) {
+        int row = r * 8 + lane_in_col;
+        S[col * 128 + row] = s_shard[r];
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Group RMSNorm & SiLU Gating Kernel for Gated DeltaNet
+// ----------------------------------------------------------------------------
+__global__ void kernel_gated_rmsnorm_silu(
+    const float* __restrict__ d_attn_core, // [48 * 128] = 6144
+    const float* __restrict__ ssm_norm,    // [128]
+    const float* __restrict__ d_gate,      // [6144]
+    float* __restrict__ d_out,             // [6144]
+    float eps
+) {
+    uint32_t head = blockIdx.x; // 0..47
+    if (head >= 48) return;
+
+    uint32_t tid = threadIdx.x; // 0..127
+    const float* in_vec = d_attn_core + head * 128;
+    const float* gate_vec = d_gate + head * 128;
+
+    // Permute from linear GDN value head layout {128, 16, 3}
+    // to tiled output projection layout {128, 3, 16}:
+    // head = k + 16 * v  -->  out_head = v + 3 * k
+    uint32_t k = head % 16;
+    uint32_t v = head / 16;
+    uint32_t out_head = v + 3 * k;
+    float* out_vec = d_out + out_head * 128;
+
+    float val = in_vec[tid];
+    float sq = val * val;
+    sq = warp_reduce_sum(sq);
+
+    __shared__ float s_warp_sq[4];
+    uint32_t warp_id = tid / 32;
+    uint32_t lane = tid % 32;
+    if (lane == 0) s_warp_sq[warp_id] = sq;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float tot = (lane < 4) ? s_warp_sq[lane] : 0.0f;
+        tot = warp_reduce_sum(tot);
+        if (lane == 0) {
+            s_warp_sq[0] = rsqrtf((tot / 128.0f) + eps);
+        }
+    }
+    __syncthreads();
+
+    float inv_rms = s_warp_sq[0];
+    float w = ssm_norm ? ssm_norm[tid] : 1.0f;
+
+    // SiLU gate: z * sigmoid(z)
+    float z = gate_vec[tid];
+    float silu_z = z / (1.0f + expf(-z));
+
+    out_vec[tid] = (val * inv_rms * w) * silu_z;
 }
 
 // ----------------------------------------------------------------------------
@@ -976,6 +1344,8 @@ NativeDecoder::~NativeDecoder() {
         if (d_x_norm_) cudaFree(d_x_norm_);
         if (d_res_) cudaFree(d_res_);
         if (d_q_) cudaFree(d_q_);
+        if (d_q_heads_) cudaFree(d_q_heads_);
+        if (d_attn_gate_) cudaFree(d_attn_gate_);
         if (d_k_) cudaFree(d_k_);
         if (d_v_) cudaFree(d_v_);
         if (d_attn_out_) cudaFree(d_attn_out_);
@@ -988,6 +1358,8 @@ NativeDecoder::~NativeDecoder() {
         if (d_k_cache_) cudaFree(d_k_cache_);
         if (d_v_cache_) cudaFree(d_v_cache_);
         if (d_ssm_state_) cudaFree(d_ssm_state_);
+        if (d_ssm_conv_state_) cudaFree(d_ssm_conv_state_);
+        if (d_conv_out_) cudaFree(d_conv_out_);
         if (d_grammar_mask_) cudaFree(d_grammar_mask_);
         if (d_top_tokens_) cudaFree(d_top_tokens_);
         if (d_top_logits_) cudaFree(d_top_logits_);
@@ -996,6 +1368,9 @@ NativeDecoder::~NativeDecoder() {
         if (d_signs_5120_) cudaFree(d_signs_5120_);
         if (d_signs_6144_) cudaFree(d_signs_6144_);
         if (d_signs_17408_) cudaFree(d_signs_17408_);
+        if (d_decay_) cudaFree(d_decay_);
+        if (d_beta_) cudaFree(d_beta_);
+        if (d_attn_core_) cudaFree(d_attn_core_);
         disable_dynamic_paged_kv();
     }
 }
@@ -1051,7 +1426,7 @@ bool NativeDecoder::initialize(const std::filesystem::path& model_path) {
             CUDA_CHECK(cudaMemcpyAsync(d_signs_5120_, h_signs.data(), 5120 * sizeof(int8_t), cudaMemcpyHostToDevice, stream));
             CUDA_CHECK(cudaMemcpyAsync(d_signs_6144_, h_signs.data() + 5120, 6144 * sizeof(int8_t), cudaMemcpyHostToDevice, stream));
             CUDA_CHECK(cudaMemcpyAsync(d_signs_17408_, h_signs.data() + 5120 + 6144, 17408 * sizeof(int8_t), cudaMemcpyHostToDevice, stream));
-            has_hadamard_ = true;
+            has_hadamard_ = true; // PrismML PTQ1_0 requires Hadamard outlier rotation
         }
     }
 
@@ -1107,11 +1482,21 @@ bool NativeDecoder::initialize(const std::filesystem::path& model_path) {
             const GGUFTensor* t_sg = model.find_tensor(p + "attn_gate.weight");
             const GGUFTensor* t_sqkv = model.find_tensor(p + "attn_qkv.weight");
             const GGUFTensor* t_sconv = model.find_tensor(p + "ssm_conv1d.weight");
+            const GGUFTensor* t_sa = model.find_tensor(p + "ssm_a");
+            const GGUFTensor* t_salpha = model.find_tensor(p + "ssm_alpha.weight");
+            const GGUFTensor* t_sbeta = model.find_tensor(p + "ssm_beta.weight");
+            const GGUFTensor* t_sdt = model.find_tensor(p + "ssm_dt.bias");
+            const GGUFTensor* t_snorm = model.find_tensor(p + "ssm_norm.weight");
             const GGUFTensor* t_so = model.find_tensor(p + "ssm_out.weight");
 
             if (t_sg) lay.ssm_gate = d_weights_ + t_sg->offset;
             if (t_sqkv) lay.ssm_qkv = d_weights_ + t_sqkv->offset;
             if (t_sconv) lay.ssm_conv1d = reinterpret_cast<const float*>(d_weights_ + t_sconv->offset);
+            if (t_sa) lay.ssm_a = reinterpret_cast<const float*>(d_weights_ + t_sa->offset);
+            if (t_salpha) lay.ssm_alpha = d_weights_ + t_salpha->offset;
+            if (t_sbeta) lay.ssm_beta = d_weights_ + t_sbeta->offset;
+            if (t_sdt) lay.ssm_dt = reinterpret_cast<const float*>(d_weights_ + t_sdt->offset);
+            if (t_snorm) lay.ssm_norm = reinterpret_cast<const float*>(d_weights_ + t_snorm->offset);
             if (t_so) lay.ssm_out = d_weights_ + t_so->offset;
         }
     }
@@ -1121,10 +1506,16 @@ bool NativeDecoder::initialize(const std::filesystem::path& model_path) {
     CUDA_CHECK(cudaMalloc(&d_x_norm_, embedding_dim_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_res_, embedding_dim_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_q_, 12288 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_q_heads_, 6144 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_attn_gate_, 6144 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_k_, 1024 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_v_, 1024 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_attn_out_, 6144 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_qkv_, 10240 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_conv_out_, 10240 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_decay_, 48 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_beta_, 48 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_attn_core_, 6144 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_gate_, ffn_dim_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_up_, ffn_dim_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_act_, ffn_dim_ * sizeof(float)));
@@ -1138,10 +1529,15 @@ bool NativeDecoder::initialize(const std::filesystem::path& model_path) {
     CUDA_CHECK(cudaMemsetAsync(d_k_cache_, 0, kv_cache_elements * sizeof(float), stream));
     CUDA_CHECK(cudaMemsetAsync(d_v_cache_, 0, kv_cache_elements * sizeof(float), stream));
 
-    // Multi-Stream SSM State (MAX_STREAMS * 48 layers * 6144 floats)
-    size_t ssm_state_elements = static_cast<size_t>(MAX_STREAMS) * 48ULL * ssm_inner_;
+    // Multi-Stream Gated DeltaNet Matrix State (MAX_STREAMS * 48 layers * 48 heads * 128 * 128 floats)
+    size_t ssm_state_elements = static_cast<size_t>(MAX_STREAMS) * 48ULL * 48ULL * 16384ULL;
     CUDA_CHECK(cudaMalloc(&d_ssm_state_, ssm_state_elements * sizeof(float)));
     CUDA_CHECK(cudaMemsetAsync(d_ssm_state_, 0, ssm_state_elements * sizeof(float), stream));
+
+    // Multi-Stream SSM Conv1D History Buffer (MAX_STREAMS * 48 layers * 4 steps * 10240 floats)
+    size_t conv_state_elements = static_cast<size_t>(MAX_STREAMS) * 48ULL * 4ULL * 10240ULL;
+    CUDA_CHECK(cudaMalloc(&d_ssm_conv_state_, conv_state_elements * sizeof(float)));
+    CUDA_CHECK(cudaMemsetAsync(d_ssm_conv_state_, 0, conv_state_elements * sizeof(float), stream));
 
     // Grammar Mask Buffer on Device
     size_t mask_words = (vocab_size_ + 31) / 32;
@@ -1296,11 +1692,12 @@ void NativeDecoder::forward_token(
         );
     }
 
+
     uint32_t norm_threads = 512;
     size_t shared_bytes = (norm_threads / 32) * sizeof(float);
 
-    uint32_t ffn_blocks = (ffn_dim_ + 31) / 32;
-    uint32_t x_blocks = (embedding_dim_ + 31) / 32;
+    uint32_t ffn_blocks = (ffn_dim_ + 3) / 4;
+    uint32_t x_blocks = (embedding_dim_ + 3) / 4;
 
     uint32_t attn_layer_counter = 0;
     uint32_t ssm_layer_counter = 0;
@@ -1325,22 +1722,41 @@ void NativeDecoder::forward_token(
         }
 
         if (lay.is_attention) {
-            uint32_t q_blocks = (12288 + 31) / 32;
-            uint32_t kv_blocks = (1024 + 31) / 32;
+            uint32_t q_blocks = (12288 + 3) / 4;
+            uint32_t kv_blocks = (1024 + 3) / 4;
 
             kernel_gemv_tq1_0<<<q_blocks, 128, 0, stream>>>(d_x_norm_, lay.attn_q, d_q_, embedding_dim_, 12288);
             kernel_gemv_tq1_0<<<kv_blocks, 128, 0, stream>>>(d_x_norm_, lay.attn_k, d_k_, embedding_dim_, 1024);
             kernel_gemv_tq1_0<<<kv_blocks, 128, 0, stream>>>(d_x_norm_, lay.attn_v, d_v_, embedding_dim_, 1024);
 
-            kernel_split_and_gate_query<<<(6144 + 255) / 256, 256, 0, stream>>>(d_q_, d_attn_out_, 6144);
+            // De-interleave Q (24*256) and Gate (24*256) from interleaved d_q_ (12288)
+            kernel_deinterleave_q_gate<<<24, 256, 0, stream>>>(
+                d_q_,
+                d_q_heads_,
+                d_attn_gate_
+            );
+
+            // Apply per-head QK-RMSNorm and NEOX Rotary Position Embeddings (RoPE) to Q (24 heads * 256) and K (4 heads * 256)
+            kernel_apply_qk_norm_and_rope<<<28, 32, 0, stream>>>(
+                d_q_heads_,
+                d_k_,
+                lay.attn_q_norm,
+                lay.attn_k_norm,
+                head_count_,
+                head_count_kv_,
+                head_dim_,
+                64,
+                10000000.0f,
+                pos
+            );
 
             kernel_attention_decode<<<head_count_, 32, 0, stream>>>(
-                d_attn_out_,
+                d_q_heads_,
                 d_k_,
                 d_v_,
                 d_k_cache_,
                 d_v_cache_,
-                d_q_,
+                d_attn_out_,
                 attn_layer_counter,
                 pos,
                 MAX_SEQ_LEN,
@@ -1356,32 +1772,78 @@ void NativeDecoder::forward_token(
                 paged_kv_.d_paged_v
             );
 
+            // Apply learned sigmoid gate from d_attn_gate_ to attention output
+            kernel_gate_attention_output<<<(6144 + 255) / 256, 256, 0, stream>>>(
+                d_attn_out_,
+                d_attn_gate_,
+                6144
+            );
+
             if (has_hadamard_) {
                 kernel_hadamard_forward<<<6144 / 1024, 512, 0, stream>>>(
-                    d_q_, d_signs_6144_, 6144
+                    d_attn_out_, d_signs_6144_, 6144
                 );
             }
 
-            kernel_gemv_tq1_0<<<x_blocks, 128, 0, stream>>>(d_q_, lay.attn_output, d_res_, 6144, embedding_dim_);
+            kernel_gemv_tq1_0<<<x_blocks, 128, 0, stream>>>(d_attn_out_, lay.attn_output, d_res_, 6144, embedding_dim_);
             kernel_add_residual<<<(embedding_dim_ + 255) / 256, 256, 0, stream>>>(d_x_, d_res_, embedding_dim_);
 
             attn_layer_counter++;
         } else {
-            uint32_t qkv_blocks = (10240 + 31) / 32;
-            uint32_t gate_blocks = (6144 + 31) / 32;
+            uint32_t qkv_blocks = (10240 + 3) / 4;
+            uint32_t gate_blocks = (6144 + 3) / 4;
+
+            kernel_deltanet_alpha_beta_step<<<48, 128, 0, stream>>>(
+                d_x_norm_,
+                lay.ssm_alpha,
+                lay.ssm_beta,
+                lay.ssm_dt,
+                lay.ssm_a,
+                d_decay_,
+                d_beta_
+            );
 
             kernel_gemv_tq1_0<<<gate_blocks, 128, 0, stream>>>(d_x_norm_, lay.ssm_gate, d_gate_, embedding_dim_, 6144);
             kernel_gemv_tq1_0<<<qkv_blocks, 128, 0, stream>>>(d_x_norm_, lay.ssm_qkv, d_qkv_, embedding_dim_, 10240);
 
-            kernel_ssm_step<<<(6144 + 255) / 256, 256, 0, stream>>>(
+            // 1D Causal Depthwise Convolution step (10240 channels, K=4, with SiLU)
+            kernel_ssm_conv1d_step<<<40, 256, 0, stream>>>(
                 d_qkv_,
-                d_gate_,
-                d_ssm_state_,
-                d_attn_out_,
+                lay.ssm_conv1d,
+                d_ssm_conv_state_,
+                d_conv_out_,
                 ssm_layer_counter,
-                ssm_inner_,
                 stream_slot
             );
+
+            // L2-Normalize Q (0..2047) and K (2048..4095) for all 16 key/query heads
+            kernel_deltanet_l2_norm<<<16, 32, 0, stream>>>(
+                d_conv_out_,
+                d_conv_out_ + 2048
+            );
+
+            // Gated DeltaNet Matrix Recurrence: 48 heads, 8 blocks per head (16 cols each)
+            kernel_deltanet_recurrence_fast<<<dim3(48, 8), 128, 0, stream>>>(
+                d_conv_out_,          // Q: 16 heads * 128
+                d_conv_out_ + 2048,   // K: 16 heads * 128
+                d_conv_out_ + 4096,   // V: 48 heads * 128
+                d_decay_,
+                d_beta_,
+                d_ssm_state_,
+                d_attn_core_,
+                ssm_layer_counter,
+                stream_slot
+            );
+
+            // Group RMSNorm & SiLU Gating: self.norm(core_attn_out, z)
+            kernel_gated_rmsnorm_silu<<<48, 128, 0, stream>>>(
+                d_attn_core_,
+                lay.ssm_norm,
+                d_gate_,
+                d_attn_out_,
+                rms_norm_eps_
+            );
+
 
             if (has_hadamard_) {
                 kernel_hadamard_forward<<<6144 / 1024, 512, 0, stream>>>(
@@ -1424,6 +1886,7 @@ void NativeDecoder::forward_token(
 
         kernel_gemv_tq1_0<<<x_blocks, 128, 0, stream>>>(d_act_, lay.ffn_down, d_ffn_out_, ffn_dim_, embedding_dim_);
         kernel_add_residual<<<(embedding_dim_ + 255) / 256, 256, 0, stream>>>(d_x_, d_ffn_out_, embedding_dim_);
+
     }
 
     // 3. Final RMSNorm & Output Logits
@@ -1442,7 +1905,7 @@ void NativeDecoder::forward_token(
             );
         }
 
-        uint32_t vocab_blocks = (vocab_size_ + 31) / 32;
+        uint32_t vocab_blocks = (vocab_size_ + 3) / 4;
         kernel_gemv_tq1_0<<<vocab_blocks, 128, 0, stream>>>(
             d_x_norm_,
             d_output_,
@@ -1466,18 +1929,30 @@ void NativeDecoder::forward_token(
         );
         CUDA_CHECK(cudaMemcpyAsync(h_top_tokens_, d_top_tokens_, TOP_CANDIDATES * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaMemcpyAsync(h_top_logits_, d_top_logits_, TOP_CANDIDATES * sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    }
+}
+
+void NativeDecoder::release_stream_slot(uint32_t stream_slot) {
+    if (stream_slot >= MAX_STREAMS) return;
+    stream_seq_pos_[stream_slot] = 0;
+    if (page_pool_) {
+        release_stream_blocks(stream_slot);
     }
 }
 
 void NativeDecoder::generate(
-    const std::string& prompt,
+    const std::vector<uint32_t>& prompt_tokens_in,
     int max_tokens,
     const TokenCallback& on_token,
     const SamplingConfig& sampling,
     uint32_t stream_id,
     bool reset_state,
     const uint32_t* d_grammar_bitmask,
-    const ToolCallCallback& on_tool_call
+    const ToolCallCallback& on_tool_call,
+    const uint32_t* stop_tokens,
+    uint32_t stop_token_count
 ) {
     if (!initialized_) return;
 
@@ -1485,30 +1960,26 @@ void NativeDecoder::generate(
     uint32_t stream_slot = stream_id % MAX_STREAMS;
 
     size_t stream_kv_stride = 16ULL * MAX_SEQ_LEN * 4 * 256;
-    size_t stream_ssm_stride = 48ULL * ssm_inner_;
+    size_t stream_ssm_stride = 48ULL * 48ULL * 16384ULL;
+    size_t stream_conv_stride = 48ULL * 4ULL * 10240ULL;
 
     if (reset_state) {
         stream_seq_pos_[stream_slot] = 0;
         CUDA_CHECK(cudaMemsetAsync(d_k_cache_ + stream_slot * stream_kv_stride, 0, stream_kv_stride * sizeof(float), stream));
         CUDA_CHECK(cudaMemsetAsync(d_v_cache_ + stream_slot * stream_kv_stride, 0, stream_kv_stride * sizeof(float), stream));
         CUDA_CHECK(cudaMemsetAsync(d_ssm_state_ + stream_slot * stream_ssm_stride, 0, stream_ssm_stride * sizeof(float), stream));
+        CUDA_CHECK(cudaMemsetAsync(d_ssm_conv_state_ + stream_slot * stream_conv_stride, 0, stream_conv_stride * sizeof(float), stream));
         if (page_pool_) {
             release_stream_blocks(stream_slot);
         }
     }
 
-    // Format prompt with ChatML if needed
-    std::string formatted_prompt = prompt;
-    if (reset_state && prompt.find("<|im_start|>") == std::string::npos) {
-        formatted_prompt = "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
-    }
-
-    std::vector<uint32_t> prompt_tokens = tokenizer_.encode(formatted_prompt);
+    std::vector<uint32_t> prompt_tokens = prompt_tokens_in;
     if (prompt_tokens.empty()) prompt_tokens.push_back(bos_token_id_);
 
     uint32_t seq_pos = stream_seq_pos_[stream_slot];
 
-    // 1. Dynamic Grammar Bitmask Initial State Sync (Zero-copy in H22)
+    // 1. Dynamic Grammar Bitmask Initial State Sync
     const uint32_t* active_bitmask = d_grammar_bitmask;
     if (active_fsm_table_ && !active_fsm_table_->states.empty()) {
         if (current_fsm_state_ >= 0 && static_cast<size_t>(current_fsm_state_) < active_fsm_table_->states.size()) {
@@ -1534,7 +2005,7 @@ void NativeDecoder::generate(
         std::vector<int32_t> prompt_i32(prompt_tokens.begin(), prompt_tokens.end());
         attach_stream_to_prefix(stream_slot, prompt_i32);
 
-        // Pre-allocate all prefill blocks in a single batched PCIe transfer (H23)
+        // Pre-allocate all prefill blocks in a single batched transfer
         uint32_t total_prefill_blocks = (prompt_tokens.size() + paged_kv_.block_size - 1) / paged_kv_.block_size;
         allocate_stream_blocks_batch(stream_slot, 0, total_prefill_blocks);
     }
@@ -1558,42 +2029,23 @@ void NativeDecoder::generate(
     std::vector<uint32_t> generated_tokens;
     generated_tokens.reserve(max_tokens);
 
-    // Determine ChatML turn boundaries to guard tool call detection.
-    // Tool calls MUST only be intercepted if emitted within an assistant turn.
-    // If a user prompt contains <tool_call> in non-assistant text, ignore it.
-    std::string assistant_marker = "<|im_start|>assistant";
-    size_t last_asst_idx = formatted_prompt.rfind(assistant_marker);
-
     std::string accumulated_text;
-    // Only accumulate prefill text that strictly follows the last assistant turn marker
-    if (last_asst_idx != std::string::npos) {
-        std::string asst_prefill = formatted_prompt.substr(last_asst_idx + assistant_marker.size());
-        size_t prompt_tc = asst_prefill.rfind("<tool_call>");
-        if (prompt_tc != std::string::npos) {
-            accumulated_text = asst_prefill.substr(prompt_tc);
-        }
-    }
-
-    // Check if assistant prefill already contains a completed tool call
-    if (on_tool_call && accumulated_text.find("</tool_call>") != std::string::npos) {
-        size_t start_tag = accumulated_text.find("<tool_call>");
-        size_t end_tag = accumulated_text.find("</tool_call>");
-        if (start_tag != std::string::npos && end_tag > start_tag) {
-            std::string json_body = accumulated_text.substr(start_tag + 11, end_tag - (start_tag + 11));
-            ToolCall tc = parse_tool_call_json(json_body, stream_id);
-            if (!tc.name.empty()) {
-                on_tool_call(tc);
-                stream_seq_pos_[stream_slot] = seq_pos;
-                return;
-            }
-        }
-    }
 
     while (generated_count < max_tokens && seq_pos < MAX_SEQ_LEN - 1) {
         uint32_t next_token = sample_next_token(sampling, generated_tokens);
         float logit = h_top_logits_[0];
 
-        if (next_token == eos_token_id_ || next_token == bos_token_id_ || next_token == tokenizer_.im_end_id()) {
+        bool is_stop = (next_token == eos_token_id_ || next_token == bos_token_id_ || next_token == tokenizer_.im_end_id());
+        if (!is_stop && stop_tokens != nullptr && stop_token_count > 0) {
+            for (uint32_t s = 0; s < stop_token_count; ++s) {
+                if (next_token == stop_tokens[s]) {
+                    is_stop = true;
+                    break;
+                }
+            }
+        }
+
+        if (is_stop) {
             // Check if accumulated text contains a completed tool call
             if (on_tool_call) {
                 size_t start_tag = accumulated_text.find("<tool_call>");
@@ -1651,7 +2103,7 @@ void NativeDecoder::generate(
             return;
         }
 
-        // Dynamically synchronize next step grammar bitmask (Zero-copy in H22)
+        // Dynamically synchronize next step grammar bitmask
         if (active_fsm_table_ && !active_fsm_table_->states.empty()) {
             if (current_fsm_state_ >= 0 && static_cast<size_t>(current_fsm_state_) < active_fsm_table_->states.size()) {
                 const auto& desc = active_fsm_table_->states[current_fsm_state_];
@@ -1693,6 +2145,31 @@ void NativeDecoder::generate(
 void NativeDecoder::generate(
     const std::string& prompt,
     int max_tokens,
+    const TokenCallback& on_token,
+    const SamplingConfig& sampling,
+    uint32_t stream_id,
+    bool reset_state,
+    const uint32_t* d_grammar_bitmask,
+    const ToolCallCallback& on_tool_call
+) {
+    if (!initialized_) return;
+
+    // Format prompt with ChatML if needed
+    std::string formatted_prompt = prompt;
+    if (reset_state && prompt.find("<|im_start|>") == std::string::npos) {
+        formatted_prompt = "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
+    }
+
+    std::vector<uint32_t> prompt_tokens = tokenizer_.encode(formatted_prompt);
+    if (prompt_tokens.empty()) prompt_tokens.push_back(bos_token_id_);
+
+    generate(prompt_tokens, max_tokens, on_token, sampling, stream_id, reset_state,
+             d_grammar_bitmask, on_tool_call, nullptr, 0);
+}
+
+void NativeDecoder::generate(
+    const std::string& prompt,
+    int max_tokens,
     ipc::ShmServer& server,
     uint32_t stream_id,
     const SamplingConfig& sampling,
@@ -1712,6 +2189,35 @@ void NativeDecoder::generate(
         [&server, stream_id](const ToolCall& tool_call) -> bool {
             return server.send_tool_call(stream_id, tool_call.id, tool_call.name, tool_call.arguments);
         }
+    );
+}
+
+void NativeDecoder::generate(
+    const std::vector<uint32_t>& prompt_tokens,
+    int max_tokens,
+    ipc::ShmServer& server,
+    uint32_t stream_id,
+    const SamplingConfig& sampling,
+    bool reset_state,
+    const uint32_t* d_grammar_bitmask,
+    const uint32_t* stop_tokens,
+    uint32_t stop_token_count
+) {
+    generate(
+        prompt_tokens,
+        max_tokens,
+        [&server, stream_id](uint32_t token_id, float logit, const std::string& text, bool is_final) -> bool {
+            return server.send_token(stream_id, token_id, logit, text, is_final);
+        },
+        sampling,
+        stream_id,
+        reset_state,
+        d_grammar_bitmask,
+        [&server, stream_id](const ToolCall& tool_call) -> bool {
+            return server.send_tool_call(stream_id, tool_call.id, tool_call.name, tool_call.arguments);
+        },
+        stop_tokens,
+        stop_token_count
     );
 }
 

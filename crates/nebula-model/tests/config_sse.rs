@@ -74,6 +74,22 @@ fn default_config_parses_and_standard_matches_the_benchmarked_launch() {
         cfg.profile("quality"),
         Err(ModelError::UnknownProfile(_))
     ));
+
+    let mut hydrogen_prof = standard.clone();
+    hydrogen_prof.backend = Some(nebula_model::config::ModelBackendKind::Hydrogen);
+    hydrogen_prof.flags = vec!["--shm-name".to_string(), "Local\\CustomShm".to_string()];
+    let h_args = hydrogen_prof.args(8080);
+    assert_eq!(
+        h_args,
+        vec![
+            "-m".to_string(),
+            hydrogen_prof.model.display().to_string(),
+            "-c".to_string(),
+            "32768".to_string(),
+            "--shm-name".to_string(),
+            "Local\\CustomShm".to_string(),
+        ]
+    );
 }
 
 #[test]

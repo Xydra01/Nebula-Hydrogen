@@ -485,6 +485,39 @@ uint32_t ShmServer::get_cuda_yield_mode() const noexcept {
     return 0;
 }
 
+int32_t ShmServer::acquire_stream_slot() noexcept {
+    if (!global_header_) return -1;
+    uint32_t current = global_header_->active_stream_mask.load(std::memory_order_relaxed);
+    while (true) {
+        int32_t slot = -1;
+        for (int32_t i = 0; i < 8; ++i) {
+            if ((current & (1u << i)) == 0) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot == -1) {
+            return -1; // All 8 stream slots exhausted
+        }
+        uint32_t next = current | (1u << slot);
+        if (global_header_->active_stream_mask.compare_exchange_weak(
+                current, next, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            return slot;
+        }
+    }
+}
+
+void ShmServer::release_stream_slot(uint32_t slot) noexcept {
+    if (!global_header_ || slot >= 8) return;
+    global_header_->active_stream_mask.fetch_and(~(1u << slot), std::memory_order_acq_rel);
+}
+
+bool ShmServer::is_slot_active(uint32_t slot) const noexcept {
+    if (!global_header_ || slot >= 8) return false;
+    uint32_t mask = global_header_->active_stream_mask.load(std::memory_order_acquire);
+    return (mask & (1u << slot)) != 0;
+}
+
 // ============================================================================
 // ShmClient Implementation
 // ============================================================================
@@ -699,6 +732,74 @@ void ShmClient::notify_tool_process_complete() noexcept {
     if (global_header_) {
         global_header_->active_tool_processes.fetch_sub(1, std::memory_order_release);
     }
+}
+
+int32_t ShmClient::acquire_stream_slot() noexcept {
+    if (!global_header_) return -1;
+    uint32_t current = global_header_->active_stream_mask.load(std::memory_order_relaxed);
+    while (true) {
+        int32_t slot = -1;
+        for (int32_t i = 0; i < 8; ++i) {
+            if ((current & (1u << i)) == 0) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot == -1) {
+            return -1; // All 8 stream slots exhausted
+        }
+        uint32_t next = current | (1u << slot);
+        if (global_header_->active_stream_mask.compare_exchange_weak(
+                current, next, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            return slot;
+        }
+    }
+}
+
+void ShmClient::release_stream_slot(uint32_t slot) noexcept {
+    if (!global_header_ || slot >= 8) return;
+    global_header_->active_stream_mask.fetch_and(~(1u << slot), std::memory_order_acq_rel);
+}
+
+bool ShmClient::is_slot_active(uint32_t slot) const noexcept {
+    if (!global_header_ || slot >= 8) return false;
+    uint32_t mask = global_header_->active_stream_mask.load(std::memory_order_acquire);
+    return (mask & (1u << slot)) != 0;
+}
+
+bool ShmClient::send_generate_tokens_request(
+    uint32_t stream_id,
+    const uint32_t* token_ids,
+    uint32_t num_tokens,
+    uint32_t max_tokens,
+    float temperature,
+    float top_p,
+    const uint32_t* stop_tokens,
+    uint32_t stop_token_count) {
+    if (!is_connected_) return false;
+    if (num_tokens > 32768) return false;
+
+    const uint32_t payload_size = static_cast<uint32_t>(sizeof(GenerateTokensRequest) + num_tokens * sizeof(uint32_t));
+    std::vector<uint8_t> buffer(payload_size);
+
+    auto* req = reinterpret_cast<GenerateTokensRequest*>(buffer.data());
+    req->stream_id = stream_id;
+    req->num_tokens = num_tokens;
+    req->max_tokens = max_tokens;
+    req->temperature = temperature;
+    req->top_p = top_p;
+    req->stop_token_count = std::min<uint32_t>(stop_token_count, 16);
+    std::memset(req->stop_tokens, 0, sizeof(req->stop_tokens));
+    if (stop_tokens && req->stop_token_count > 0) {
+        std::memcpy(req->stop_tokens, stop_tokens, req->stop_token_count * sizeof(uint32_t));
+    }
+
+    if (num_tokens > 0 && token_ids != nullptr) {
+        std::memcpy(buffer.data() + sizeof(GenerateTokensRequest), token_ids, num_tokens * sizeof(uint32_t));
+    }
+
+    return send_request(MessageType::MSG_GENERATE_TOKENS_REQUEST, stream_id, FrameFlags::NONE,
+                        buffer.data(), payload_size);
 }
 
 } // namespace hydrogen::ipc
