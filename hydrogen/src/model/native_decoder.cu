@@ -288,6 +288,58 @@ __global__ void kernel_gemv_tq1_0(
 }
 
 // ----------------------------------------------------------------------------
+// Multi-Stream & Batched Matrix-Vector Multiplication for GGUF TQ1_0 Weights (Issue H22B)
+// Computes Y = W * X for B concurrent tokens / streams in a single kernel launch
+// ----------------------------------------------------------------------------
+__global__ void kernel_batched_gemv_tq1_0(
+    const float* __restrict__ d_x,         // [batch_size, in_dim]
+    const uint8_t* __restrict__ d_weight,  // [out_dim, blocks_per_row * 56]
+    float* __restrict__ d_out,             // [batch_size, out_dim]
+    uint32_t in_dim,
+    uint32_t out_dim,
+    uint32_t batch_size
+) {
+    uint32_t warp_global_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    uint32_t b_idx = blockIdx.y;
+    if (warp_global_id >= out_dim || b_idx >= batch_size) return;
+
+    uint32_t lane = threadIdx.x % 32;
+    uint32_t blocks_per_row = in_dim / 256;
+    const uint8_t* row_bytes = d_weight + static_cast<uint64_t>(warp_global_id) * blocks_per_row * 56;
+    const float* x_ptr = d_x + static_cast<uint64_t>(b_idx) * in_dim;
+
+    float acc = 0.0f;
+
+    for (uint32_t b = 0; b < blocks_per_row; ++b) {
+        const uint8_t* blk = row_bytes + b * 56;
+        uint32_t blk_base = b * 256;
+
+        #pragma unroll
+        for (uint32_t sub = 0; sub < 2; ++sub) {
+            const uint8_t* sub_bytes = blk + sub * 28;
+            float d = __half2float(*reinterpret_cast<const __half*>(sub_bytes + 26));
+            if (isnan(d) || isinf(d)) d = 0.0f;
+            uint32_t sub_base = blk_base + sub * 128;
+
+            float lane_acc = 0.0f;
+            #pragma unroll
+            for (uint32_t k = 0; k < 4; ++k) {
+                uint32_t in_sub = lane * 4 + k;
+                int trit = decode_ptq1_0_trit(in_sub, sub_bytes);
+                lane_acc += static_cast<float>(trit) * x_ptr[sub_base + in_sub];
+            }
+
+            lane_acc = warp_reduce_sum(lane_acc);
+            acc += d * lane_acc;
+        }
+    }
+
+    if (lane == 0) {
+        d_out[static_cast<uint64_t>(b_idx) * out_dim + warp_global_id] = acc;
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Residual Add: out += res
 // ----------------------------------------------------------------------------
 __global__ void kernel_add_residual(
@@ -1029,6 +1081,9 @@ ToolCall parse_tool_call_json(const std::string& raw_json, uint32_t stream_id) {
                 size_t q2 = raw_json.find('"', q1 + 1);
                 if (q2 != std::string::npos) {
                     result.name = raw_json.substr(q1 + 1, q2 - (q1 + 1));
+                    result.name.erase(std::remove_if(result.name.begin(), result.name.end(), [](unsigned char c) {
+                        return std::isspace(c);
+                    }), result.name.end());
                 }
             }
         }
@@ -2096,8 +2151,25 @@ void NativeDecoder::generate(
         allocate_stream_blocks_batch(stream_slot, 0, total_prefill_blocks);
     }
 
-    // Prefill Phase
-    for (size_t i = 0; i < prompt_tokens.size(); ++i) {
+    // Prefill Phase with KV-Cache & Prefix Reuse (Issue H22B)
+    size_t start_token_idx = 0;
+    if (!reset_state && seq_pos > 0 && prompt_tokens.size() > seq_pos) {
+        // Optimization: The prefix tokens (0..seq_pos-1) are already resident in KV cache and SSM state
+        start_token_idx = seq_pos;
+    } else if (!reset_state && seq_pos > 0 && prompt_tokens.size() <= seq_pos) {
+        // Prompt was trimmed or reset; reset seq_pos
+        seq_pos = 0;
+        stream_seq_pos_[stream_slot] = 0;
+        CUDA_CHECK(cudaMemsetAsync(d_k_cache_ + stream_slot * stream_kv_stride, 0, stream_kv_stride * sizeof(float), stream));
+        CUDA_CHECK(cudaMemsetAsync(d_v_cache_ + stream_slot * stream_kv_stride, 0, stream_kv_stride * sizeof(float), stream));
+        CUDA_CHECK(cudaMemsetAsync(d_ssm_state_ + stream_slot * stream_ssm_stride, 0, stream_ssm_stride * sizeof(float), stream));
+        CUDA_CHECK(cudaMemsetAsync(d_ssm_conv_state_ + stream_slot * stream_conv_stride, 0, stream_conv_stride * sizeof(float), stream));
+        if (page_pool_) {
+            release_stream_blocks(stream_slot);
+        }
+    }
+
+    for (size_t i = start_token_idx; i < prompt_tokens.size(); ++i) {
         if (page_pool_) {
             uint32_t logical_block = seq_pos / paged_kv_.block_size;
             allocate_stream_block(stream_slot, logical_block);
@@ -2145,6 +2217,12 @@ void NativeDecoder::generate(
                         return;
                     }
                 }
+                ToolCall tc = parse_tool_call_json(accumulated_text, stream_id);
+                if (!tc.name.empty()) {
+                    on_tool_call(tc);
+                    stream_seq_pos_[stream_slot] = seq_pos;
+                    return;
+                }
             }
             if (on_token) on_token(next_token, logit, "", true);
             stream_seq_pos_[stream_slot] = seq_pos;
@@ -2161,16 +2239,55 @@ void NativeDecoder::generate(
         }
 
         // Check for completed tool call before EOS
-        if (on_tool_call && accumulated_text.find("</tool_call>") != std::string::npos) {
-            size_t start_tag = accumulated_text.find("<tool_call>");
-            size_t end_tag = accumulated_text.find("</tool_call>");
-            if (start_tag != std::string::npos && end_tag > start_tag) {
-                std::string json_body = accumulated_text.substr(start_tag + 11, end_tag - (start_tag + 11));
-                ToolCall tc = parse_tool_call_json(json_body, stream_id);
-                if (!tc.name.empty()) {
-                    on_tool_call(tc);
-                    stream_seq_pos_[stream_slot] = seq_pos;
-                    return;
+        if (on_tool_call) {
+            // 1. Tagged format: <tool_call> ... </tool_call>
+            if (accumulated_text.find("</tool_call>") != std::string::npos) {
+                size_t start_tag = accumulated_text.find("<tool_call>");
+                size_t end_tag = accumulated_text.find("</tool_call>");
+                if (start_tag != std::string::npos && end_tag > start_tag) {
+                    std::string json_body = accumulated_text.substr(start_tag + 11, end_tag - (start_tag + 11));
+                    ToolCall tc = parse_tool_call_json(json_body, stream_id);
+                    if (!tc.name.empty()) {
+                        on_tool_call(tc);
+                        stream_seq_pos_[stream_slot] = seq_pos;
+                        return;
+                    }
+                }
+            }
+
+            // 2. Untagged/Raw JSON format: {"name": "...", "arguments": {...}}
+            if (token_str.find('}') != std::string::npos) {
+                size_t name_pos = accumulated_text.find("\"name\"");
+                if (name_pos != std::string::npos) {
+                    size_t start_obj = accumulated_text.rfind('{', name_pos);
+                    if (start_obj != std::string::npos) {
+                        int depth = 0;
+                        bool in_str = false;
+                        bool esc = false;
+                        for (size_t k = start_obj; k < accumulated_text.size(); ++k) {
+                            char c = accumulated_text[k];
+                            if (in_str) {
+                                if (esc) esc = false;
+                                else if (c == '\\') esc = true;
+                                else if (c == '"') in_str = false;
+                            } else {
+                                if (c == '"') in_str = true;
+                                else if (c == '{') depth++;
+                                else if (c == '}') {
+                                    depth--;
+                                    if (depth == 0) {
+                                        std::string raw_obj = accumulated_text.substr(start_obj, k - start_obj + 1);
+                                        ToolCall tc = parse_tool_call_json(raw_obj, stream_id);
+                                        if (!tc.name.empty()) {
+                                            on_tool_call(tc);
+                                            stream_seq_pos_[stream_slot] = seq_pos;
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

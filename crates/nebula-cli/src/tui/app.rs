@@ -107,6 +107,12 @@ pub struct TaskItem {
     pub language: Option<String>,
     /// Whether the language MCP process is healthy.
     pub mcp_healthy: bool,
+    /// Number of engine streams allocated to this task.
+    pub streams: usize,
+    /// Number of tokens generated live in current step.
+    pub live_tokens: usize,
+    /// Short snippet preview of live generated text or thinking.
+    pub live_preview: Option<String>,
 }
 
 /// A recorded tool call step.
@@ -235,10 +241,13 @@ impl TuiApp {
     /// Returns the number of currently active executor tasks/streams.
     #[must_use]
     pub fn active_streams(&self) -> usize {
-        self.tasks
+        let count: usize = self
+            .tasks
             .iter()
             .filter(|t| matches!(t.status, TuiTaskStatus::Running | TuiTaskStatus::Committing))
-            .count()
+            .map(|t| t.streams.max(1))
+            .sum();
+        count.min(self.max_streams())
     }
 
     /// Returns the maximum concurrency streams supported by the engine/supervisor.
@@ -429,7 +438,41 @@ impl TuiApp {
         match event {
             Event::ChatToken(t) => {
                 let task_id = TaskId::from_ulid(t.chat_id.ulid());
-                if !self.tasks.iter().any(|task| task.id == task_id) {
+                if let Some(task) = self.tasks.iter_mut().find(|task| task.id == task_id) {
+                    task.live_tokens += 1;
+                    if let Some(s) = t.streams {
+                        task.streams = s as usize;
+                    }
+                    if !t.text.is_empty() {
+                        let snippet = t.text.trim();
+                        if !snippet.is_empty() {
+                            task.live_preview = Some(snippet.chars().take(28).collect());
+                        }
+                    } else if !t.reasoning.is_empty() {
+                        let snippet = t.reasoning.trim();
+                        if !snippet.is_empty() {
+                            task.live_preview = Some(format!(
+                                "thinking: {}",
+                                snippet.chars().take(20).collect::<String>()
+                            ));
+                        }
+                    }
+                } else {
+                    let mut preview = None;
+                    if !t.text.is_empty() {
+                        let snippet = t.text.trim();
+                        if !snippet.is_empty() {
+                            preview = Some(snippet.chars().take(28).collect());
+                        }
+                    } else if !t.reasoning.is_empty() {
+                        let snippet = t.reasoning.trim();
+                        if !snippet.is_empty() {
+                            preview = Some(format!(
+                                "thinking: {}",
+                                snippet.chars().take(20).collect::<String>()
+                            ));
+                        }
+                    }
                     self.tasks.push(TaskItem {
                         id: task_id,
                         status: TuiTaskStatus::Running,
@@ -437,6 +480,9 @@ impl TuiApp {
                         step_count: 0,
                         language: self.active_language.clone(),
                         mcp_healthy: true,
+                        streams: t.streams.unwrap_or(1) as usize,
+                        live_tokens: 1,
+                        live_preview: preview,
                     });
                 }
                 if !t.reasoning.is_empty() {
@@ -462,6 +508,10 @@ impl TuiApp {
                 // Update task or insert
                 if let Some(task) = self.tasks.iter_mut().find(|t| t.id == step.task_id) {
                     task.step_count = step.step_index as usize;
+                    task.live_preview = None;
+                    if let Some(s) = step.streams {
+                        task.streams = s as usize;
+                    }
                 } else {
                     self.tasks.push(TaskItem {
                         id: step.task_id,
@@ -470,6 +520,9 @@ impl TuiApp {
                         step_count: step.step_index as usize,
                         language: self.active_language.clone(),
                         mcp_healthy: true,
+                        streams: step.streams.unwrap_or(1) as usize,
+                        live_tokens: 0,
+                        live_preview: None,
                     });
                 }
 
@@ -516,6 +569,7 @@ impl TuiApp {
                 if let Some(task) = self.tasks.iter_mut().find(|t| t.id == done.task_id) {
                     task.status = resolved_status;
                     task.summary = done.summary.clone();
+                    task.live_preview = None;
                 } else {
                     self.tasks.push(TaskItem {
                         id: done.task_id,
@@ -524,6 +578,9 @@ impl TuiApp {
                         step_count: 0,
                         language: self.active_language.clone(),
                         mcp_healthy: true,
+                        streams: 1,
+                        live_tokens: 0,
+                        live_preview: None,
                     });
                 }
 

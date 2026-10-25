@@ -221,10 +221,12 @@ Environment & Tools: \
 - System drives: The active repository/worktree is on drive F:. Never touch or reference drive C:. \
 - Available tools: Standard environment tools such as python, git, uv, cargo, and pytest are available in PATH. Run them directly without hardcoded absolute paths. \
 - Filesystem: Always use built-in tools (such as fs.list, fs.read, fs.write) to examine or modify files in the repository rather than shell commands like dir or cat. \
+- EMPTY WORKTREE: If the repository or current directory is empty (only containing .git or no source files), do NOT repeatedly list the directory. Immediately create the required source files and test files using fs.write. \
 TOOL CALL FORMAT: When invoking a tool, you MUST wrap your call in <tool_call> tags and format it as a JSON object with 'name' and 'arguments': \
 <tool_call> \
 {\"name\": \"tool_name\", \"arguments\": {\"param1\": \"val1\"}} \
 </tool_call> \
+Never insert newlines inside tool names (e.g. use \"fs.write\", \"fs.read\", \"fs.list\", \"shell.run\"). \
 EXECUTION RULE: Execute tool calls while work is in progress. Do NOT output conversational plans, status updates, or thoughts without tool calls. If you need to inspect files or run commands, invoke the tools directly. \
 EXIT DIRECTIVE: Once your verification and test commands pass with exit code 0 and satisfy the Definition of Done, the task is complete. You MUST immediately stop calling tools. Output your final completion summary in plain text without invoking any further tools to conclude the task.",
     );
@@ -262,11 +264,16 @@ EXIT DIRECTIVE: Once your verification and test commands pass with exit code 0 a
     ];
 
     let num_candidates = params
-        .language_config
-        .as_ref()
-        .and_then(|v| v.get("speculative_candidates"))
-        .and_then(Value::as_u64)
-        .and_then(|n| usize::try_from(n).ok())
+        .streams
+        .map(|s| s as usize)
+        .or_else(|| {
+            params
+                .language_config
+                .as_ref()
+                .and_then(|v| v.get("speculative_candidates"))
+                .and_then(Value::as_u64)
+                .and_then(|n| usize::try_from(n).ok())
+        })
         .or_else(|| {
             std::env::var("NEBULA_SPECULATIVE_CANDIDATES")
                 .ok()
@@ -320,6 +327,7 @@ EXIT DIRECTIVE: Once your verification and test commands pass with exit code 0 a
                     language_tools: &language_tools,
                     language_id: lang_module.as_ref().map(|m| m.id()),
                     verification_target: params.verification_target.as_deref(),
+                    candidates: 1,
                 },
                 &mut messages,
             );
@@ -380,6 +388,7 @@ EXIT DIRECTIVE: Once your verification and test commands pass with exit code 0 a
                         language_tools: &language_tools,
                         language_id: lang_module.as_ref().map(|m| m.id()),
                         verification_target: params.verification_target.as_deref(),
+                        candidates: u32::try_from(num_candidates).unwrap_or(1),
                     },
                     c_messages,
                 );
@@ -458,6 +467,7 @@ EXIT DIRECTIVE: Once your verification and test commands pass with exit code 0 a
                 language_tools: &language_tools,
                 language_id: lang_module.as_ref().map(|m| m.id()),
                 verification_target: params.verification_target.as_deref(),
+                candidates: 1,
             },
             &mut messages,
         );
@@ -586,6 +596,7 @@ struct LoopContext<'a> {
     language_tools: &'a [Arc<dyn nebula_tools::BuiltinTool>],
     language_id: Option<&'a str>,
     verification_target: Option<&'a str>,
+    candidates: u32,
 }
 
 fn normalize_mount_path(p: &Path) -> String {
@@ -765,6 +776,7 @@ async fn execute_loop(
                             text.clone()
                         },
                         reasoning: if reasoning { text } else { String::new() },
+                        streams: Some(ctx.candidates),
                     });
                     ctx.shared.emit_event(token_ev);
                 }
@@ -859,9 +871,9 @@ async fn execute_loop(
                 } else if is_empty {
                     "Please provide a final summary of what was accomplished, or invoke the appropriate tools to continue the task."
                 } else if tool_calls_executed > 0 {
-                    "If all necessary actions are complete, please provide your final plain-text summary of what was accomplished. Otherwise, continue executing the task using the available tools."
+                    "Please proceed with executing the task. If new code files need to be created, invoke fs.write now. If all actions are complete, provide your final summary."
                 } else {
-                    "Please proceed with executing the task using the available tools now."
+                    "Please proceed with executing the task using the available tools now. If creating a new project or file, use fs.write directly."
                 };
                 messages.push(ChatMessage {
                     role: Role::User,
@@ -938,6 +950,7 @@ async fn execute_loop(
             step_id,
             step_index,
             tool_calls: tool_names.clone(),
+            streams: Some(ctx.candidates),
         });
         ctx.shared.emit_event(step_ev);
 
@@ -958,7 +971,8 @@ async fn execute_loop(
         });
 
         // Dispatch each tool call within worktree and job scopes
-        for call in output.tool_calls {
+        for mut call in output.tool_calls {
+            call.name = call.name.split_whitespace().collect::<String>();
             if ctx.token.is_cancelled() {
                 return (TaskStatus::Cancelled, "task cancelled".into());
             }
@@ -1260,6 +1274,7 @@ async fn execute_loop(
                 chat_id,
                 text: outcome_summary,
                 reasoning: String::new(),
+                streams: Some(ctx.candidates),
             }));
 
             let tool_output = format!("[tool result: {}]\n{}", call.name, result_content);
@@ -1633,25 +1648,138 @@ pub(crate) fn extract_tool_calls_from_text(text: &str) -> Vec<nebula_model::Tool
         }
     }
 
+    // Direct raw JSON fallback without <tool_call> wrapper
+    if calls.is_empty()
+        && let Some(name_pos) = text.find("\"name\"")
+    {
+        let start = text[..name_pos].rfind('{').unwrap_or(name_pos);
+        let cand = &text[start..];
+        if let Some(call) = parse_single_tool_call_body(cand, calls.len()) {
+            calls.push(call);
+        }
+    }
+
     calls
+}
+
+fn sanitize_json_literal_newlines(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_str = false;
+    let mut escape = false;
+    for c in input.chars() {
+        if in_str {
+            if escape {
+                escape = false;
+                out.push(c);
+            } else if c == '\\' {
+                escape = true;
+                out.push(c);
+            } else if c == '"' {
+                in_str = false;
+                out.push(c);
+            } else if c == '\n' {
+                out.push_str("\\n");
+            } else if c == '\r' {
+                out.push_str("\\r");
+            } else if c == '\t' {
+                out.push_str("\\t");
+            } else {
+                out.push(c);
+            }
+        } else {
+            if c == '"' {
+                in_str = true;
+            }
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn parse_single_tool_call_body(body: &str, index: usize) -> Option<nebula_model::ToolCall> {
     let trimmed = body.trim();
-    if trimmed.starts_with('{')
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed)
-        && let Some(name) = v.get("name").and_then(|n| n.as_str())
-    {
-        let arguments = match v.get("arguments") {
-            Some(serde_json::Value::String(s)) => s.clone(),
-            Some(other) => other.to_string(),
-            None => "{}".to_string(),
-        };
-        return Some(nebula_model::ToolCall {
-            id: format!("call_extracted_{index}"),
-            name: name.to_string(),
-            arguments,
+    if trimmed.starts_with('{') {
+        let parsed_val = serde_json::from_str::<serde_json::Value>(trimmed).or_else(|_| {
+            serde_json::from_str::<serde_json::Value>(&sanitize_json_literal_newlines(trimmed))
         });
+
+        if let Ok(v) = parsed_val
+            && let Some(name) = v.get("name").and_then(|n| n.as_str())
+        {
+            let clean_name = name.split_whitespace().collect::<String>();
+            let arguments = match v.get("arguments") {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(other) => other.to_string(),
+                None => "{}".to_string(),
+            };
+            return Some(nebula_model::ToolCall {
+                id: format!("call_extracted_{index}"),
+                name: clean_name,
+                arguments,
+            });
+        }
+
+        // Heuristic fallback if JSON is truncated or has syntax issues
+        if let Some(name_pos) = trimmed.find("\"name\"") {
+            let after_name = &trimmed[name_pos + 6..];
+            if let Some(colon) = after_name.find(':') {
+                let after_colon = &after_name[colon + 1..];
+                if let Some(q1) = after_colon.find('"') {
+                    let after_q1 = &after_colon[q1 + 1..];
+                    if let Some(q2) = after_q1.find('"') {
+                        let raw_name = &after_q1[..q2];
+                        let clean_name = raw_name.split_whitespace().collect::<String>();
+                        if !clean_name.is_empty() {
+                            let arguments = if let Some(args_pos) = trimmed.find("\"arguments\"") {
+                                let after_args = &trimmed[args_pos + 11..];
+                                if let Some(colon) = after_args.find(':') {
+                                    let args_cand = after_args[colon + 1..].trim();
+                                    if args_cand.starts_with('{') {
+                                        let mut depth = 0;
+                                        let mut in_str = false;
+                                        let mut esc = false;
+                                        let mut end_idx = args_cand.len();
+                                        for (i, c) in args_cand.char_indices() {
+                                            if in_str {
+                                                if esc {
+                                                    esc = false;
+                                                } else if c == '\\' {
+                                                    esc = true;
+                                                } else if c == '"' {
+                                                    in_str = false;
+                                                }
+                                            } else if c == '"' {
+                                                in_str = true;
+                                            } else if c == '{' {
+                                                depth += 1;
+                                            } else if c == '}' {
+                                                depth -= 1;
+                                                if depth == 0 {
+                                                    end_idx = i + 1;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        args_cand[..end_idx].to_string()
+                                    } else {
+                                        "{}".to_string()
+                                    }
+                                } else {
+                                    "{}".to_string()
+                                }
+                            } else {
+                                "{}".to_string()
+                            };
+                            return Some(nebula_model::ToolCall {
+                                id: format!("call_extracted_{index}"),
+                                name: clean_name,
+                                arguments,
+                            });
+                        }
+                    }
+                }
+            }
+        }
     }
 
     if trimmed.contains("<function=") {
@@ -1765,5 +1893,24 @@ mod tests {
         let args: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
         assert_eq!(args["path"], ".");
         assert_eq!(args["recursive"], false);
+    }
+
+    #[test]
+    fn test_extract_tool_calls_with_split_newline_in_name() {
+        let text = "<think>\nThe directory appears to be empty.\n</think>\n\n<tool_call>\n{\n\"name\": \"fs.\nlist\",\n\"arguments\": {\n\"path\": \".\"\n}\n}\n</tool_call>";
+        let calls = extract_tool_calls_from_text(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "fs.list");
+        let args: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(args["path"], ".");
+    }
+
+    #[test]
+    fn test_extract_tool_calls_direct_raw_json() {
+        let text =
+            "Here is the tool call:\n{\"name\": \"fs.list\", \"arguments\": {\"path\": \".\"}}\n";
+        let calls = extract_tool_calls_from_text(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "fs.list");
     }
 }

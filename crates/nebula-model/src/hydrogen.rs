@@ -236,7 +236,8 @@ impl HydrogenBackend {
                                     .get("name")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("")
-                                    .to_owned(),
+                                    .split_whitespace()
+                                    .collect::<String>(),
                                 arguments: tc
                                     .get("arguments")
                                     .and_then(|v| v.as_str().map(str::to_owned))

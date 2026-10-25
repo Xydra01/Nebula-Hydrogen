@@ -343,8 +343,37 @@ fn render_tasks_pane(app: &TuiApp, frame: &mut Frame, area: Rect) {
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(format!(" (steps: {}) ", task.step_count)),
-                    Span::styled(&task.summary, Style::default().fg(Color::DarkGray)),
                 ]);
+
+                if task.status == crate::tui::TuiTaskStatus::Running {
+                    if task.streams > 1 {
+                        spans.push(Span::styled(
+                            format!("[{}s] ", task.streams),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                    if task.live_tokens > 0 {
+                        spans.push(Span::styled(
+                            format!("[⚡ {} tok] ", task.live_tokens),
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                    if let Some(preview) = &task.live_preview {
+                        spans.push(Span::styled(
+                            format!("\"{preview}\" "),
+                            Style::default().fg(Color::Cyan),
+                        ));
+                    }
+                }
+
+                spans.push(Span::styled(
+                    &task.summary,
+                    Style::default().fg(Color::DarkGray),
+                ));
 
                 let line = Line::from(spans);
 

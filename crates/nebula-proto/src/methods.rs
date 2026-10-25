@@ -299,6 +299,30 @@ pub struct TaskCreateParams {
     /// Optional observable verification command target (e.g. "test.run" or tagged "shell.run" command).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification_target: Option<String>,
+    /// Number of concurrent streams assigned to this task (defaults to 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streams: Option<u32>,
+}
+
+impl TaskCreateParams {
+    /// Creates a minimal `TaskCreateParams` with required goal and repo.
+    #[must_use]
+    pub fn new(goal: impl Into<String>, repo: impl Into<PathBuf>) -> Self {
+        Self {
+            goal: goal.into(),
+            repo: repo.into(),
+            start_point: None,
+            profile: None,
+            max_tool_calls: None,
+            max_tokens: None,
+            wall_time_secs: None,
+            create_pr: None,
+            language: None,
+            language_config: None,
+            verification_target: None,
+            streams: None,
+        }
+    }
 }
 
 /// Initial response to `task.create`, returned before any `task.*` events stream.

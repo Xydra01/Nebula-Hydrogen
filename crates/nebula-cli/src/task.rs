@@ -48,6 +48,9 @@ pub struct TaskRunArgs {
     /// Optional observable verification command target (e.g. "pytest" or "test.run").
     #[arg(long)]
     pub verification_target: Option<String>,
+    /// Number of concurrent streams assigned to this task (defaults to 1).
+    #[arg(long, default_value = "1")]
+    pub streams: u32,
 }
 
 /// Heuristically detects the workspace language from repository manifest files.
@@ -105,6 +108,7 @@ pub(crate) async fn run(ctx: &Ctx, args: &TaskRunArgs, out: &mut dyn Write) -> a
         language,
         language_config,
         verification_target: args.verification_target.clone(),
+        streams: Some(args.streams),
     };
 
     let started: TaskStarted = c.call(Method::TaskCreate(params)).await?;
