@@ -55,17 +55,20 @@ inline constexpr double MAX_SIGNALING_LATENCY_CEILING_US = 50.0;
 // ============================================================================
 
 enum class MessageType : uint16_t {
-    MSG_NONE              = 0x0000,
-    MSG_PING              = 0x0001,
-    MSG_PONG              = 0x0002,
-    MSG_WRAP_MARKER       = 0x000F, ///< Sentinel indicating ring buffer wrap-around
-    MSG_GENERATE_REQUEST  = 0x0010,
-    MSG_TOKEN_CHUNK       = 0x0020,
-    MSG_TOOL_CALL         = 0x0030,
-    MSG_TOOL_SPAWN        = 0x0031,
-    MSG_TOOL_COMPLETE     = 0x0032,
-    MSG_CANCEL_STREAM     = 0x0040,
-    MSG_TERMINATE_ENGINE  = 0x00FF
+    MSG_NONE                    = 0x0000,
+    MSG_PING                    = 0x0001,
+    MSG_PONG                    = 0x0002,
+    MSG_WRAP_MARKER             = 0x000F, ///< Sentinel indicating ring buffer wrap-around
+    MSG_GENERATE_REQUEST        = 0x0010,
+    MSG_GENERATE_TOKENS_REQUEST = 0x0011, ///< Binary pre-tokenized token array request
+    MSG_ERROR_SLOTS_EXHAUSTED   = 0x0012, ///< Backpressure signal when all 8 stream slots are leased
+    MSG_RELEASE_STREAM          = 0x0013, ///< Explicit release of stream slot lease & KV cache
+    MSG_TOKEN_CHUNK             = 0x0020,
+    MSG_TOOL_CALL               = 0x0030,
+    MSG_TOOL_SPAWN              = 0x0031,
+    MSG_TOOL_COMPLETE           = 0x0032,
+    MSG_CANCEL_STREAM           = 0x0040,
+    MSG_TERMINATE_ENGINE        = 0x00FF
 };
 
 namespace FrameFlags {
@@ -115,6 +118,18 @@ struct GenerateParams {
     uint8_t reserved[6];
 };
 
+/// @brief Pre-tokenized binary token request submitted with MSG_GENERATE_TOKENS_REQUEST
+struct GenerateTokensRequest {
+    uint32_t stream_id;
+    uint32_t num_tokens;
+    uint32_t max_tokens;
+    float temperature;
+    float top_p;
+    uint32_t stop_token_count;
+    uint32_t stop_tokens[16];
+    // Variable-length uint32_t token_ids[num_tokens] immediately follows in the payload
+};
+
 /// @brief Tool call descriptor submitted with MSG_TOOL_CALL
 struct ToolCallDescriptor {
     uint32_t call_id;
@@ -155,6 +170,9 @@ struct alignas(64) ShmGlobalHeader {
     uint32_t daemon_pid;
     uint32_t engine_pid;
 
+    /// @brief Atomic bitmask of active stream leases (bits 0..7 for streams 0..7)
+    std::atomic<uint32_t> active_stream_mask;
+
     /// @brief Immediate Process Spawn Hook: atomic counter incremented when tool processes spawn
     alignas(64) std::atomic<uint32_t> active_tool_processes;
 
@@ -178,6 +196,7 @@ static_assert(offsetof(ShmQueueHeader, tail) == 128, "ShmQueueHeader tail offset
 static_assert(offsetof(ShmQueueHeader, total_bytes_written) == 136, "ShmQueueHeader total_bytes_written offset mismatch");
 
 static_assert(sizeof(ShmGlobalHeader) == 576, "ShmGlobalHeader size mismatch with Rust IPC");
+static_assert(offsetof(ShmGlobalHeader, active_stream_mask) == 24, "ShmGlobalHeader active_stream_mask offset mismatch");
 static_assert(offsetof(ShmGlobalHeader, active_tool_processes) == 64, "ShmGlobalHeader active_tool_processes offset mismatch");
 static_assert(offsetof(ShmGlobalHeader, cuda_yield_mode) == 128, "ShmGlobalHeader cuda_yield_mode offset mismatch");
 static_assert(offsetof(ShmGlobalHeader, request_queue_offset) == 136, "ShmGlobalHeader request_queue_offset offset mismatch");

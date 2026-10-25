@@ -125,6 +125,11 @@ public:
                       size_t max_payload_len,
                       uint32_t timeout_ms = 1000);
 
+    // Stream-Lease Registry Operations (0..7)
+    int32_t acquire_stream_slot() noexcept;
+    void release_stream_slot(uint32_t slot) noexcept;
+    [[nodiscard]] bool is_slot_active(uint32_t slot) const noexcept;
+
     // Process Spawn Hook Coordination
     void set_active_tool_processes(uint32_t count) noexcept;
     [[nodiscard]] uint32_t get_active_tool_processes() const noexcept;
@@ -190,6 +195,11 @@ public:
 
     [[nodiscard]] bool is_connected() const noexcept { return is_connected_; }
 
+    // Stream-Lease Registry Operations (0..7)
+    int32_t acquire_stream_slot() noexcept;
+    void release_stream_slot(uint32_t slot) noexcept;
+    [[nodiscard]] bool is_slot_active(uint32_t slot) const noexcept;
+
     // Submit requests to Engine (Daemon -> Engine)
     bool send_request(MessageType msg_type,
                       uint32_t stream_id,
@@ -197,6 +207,18 @@ public:
                       const void* payload,
                       uint32_t payload_size,
                       uint64_t sequence_num = 0);
+
+    // Binary Token Request Submission (Zero-Copy)
+    bool send_generate_tokens_request(
+        uint32_t stream_id,
+        const uint32_t* token_ids,
+        uint32_t num_tokens,
+        uint32_t max_tokens = 256,
+        float temperature = 0.7f,
+        float top_p = 0.8f,
+        const uint32_t* stop_tokens = nullptr,
+        uint32_t stop_token_count = 0
+    );
 
     // Read responses/tokens from Engine (Engine -> Daemon)
     bool poll_response(IpcFrameHeader& out_header,

@@ -78,6 +78,12 @@ pub enum MessageType {
     WrapMarker = 0x000F,
     /// Chat/generate request (daemon → engine).
     GenerateRequest = 0x0010,
+    /// Pre-tokenized binary token request (daemon → engine).
+    GenerateTokensRequest = 0x0011,
+    /// Backpressure: all 8 stream slots are currently leased.
+    ErrorSlotsExhausted = 0x0012,
+    /// Explicit release of stream slot lease & KV cache.
+    ReleaseStream = 0x0013,
     /// Token chunk (engine → daemon).
     TokenChunk = 0x0020,
     /// Tool call descriptor (engine → daemon).
@@ -102,6 +108,9 @@ impl MessageType {
             0x0002 => Some(Self::Pong),
             0x000F => Some(Self::WrapMarker),
             0x0010 => Some(Self::GenerateRequest),
+            0x0011 => Some(Self::GenerateTokensRequest),
+            0x0012 => Some(Self::ErrorSlotsExhausted),
+            0x0013 => Some(Self::ReleaseStream),
             0x0020 => Some(Self::TokenChunk),
             0x0030 => Some(Self::ToolCall),
             0x0031 => Some(Self::ToolSpawn),
@@ -205,6 +214,33 @@ impl TokenPayload {
 }
 
 // ---------------------------------------------------------------------------
+// GenerateTokensRequest payload — mirrors `GenerateTokensRequest` (pack 8)
+// ---------------------------------------------------------------------------
+
+/// Pre-tokenized binary token request submitted with `GenerateTokensRequest`.
+#[derive(Clone, Copy, Debug)]
+#[repr(C, packed(8))]
+pub struct GenerateTokensRequest {
+    /// Target stream slot ID.
+    pub stream_id: u32,
+    /// Number of pre-tokenized token IDs following this header.
+    pub num_tokens: u32,
+    /// Maximum tokens to generate.
+    pub max_tokens: u32,
+    /// Sampling temperature (0.0 for greedy argmax).
+    pub temperature: f32,
+    /// Top-p nucleus sampling threshold.
+    pub top_p: f32,
+    /// Number of valid stop tokens in `stop_tokens`.
+    pub stop_token_count: u32,
+    /// Array of up to 16 stop token IDs.
+    pub stop_tokens: [u32; 16],
+}
+
+/// Size of `GenerateTokensRequest` header in bytes.
+pub const GENERATE_TOKENS_REQUEST_SIZE: usize = std::mem::size_of::<GenerateTokensRequest>();
+
+// ---------------------------------------------------------------------------
 // Queue header — mirrors `ShmQueueHeader` (alignas 64)
 // ---------------------------------------------------------------------------
 
@@ -257,8 +293,10 @@ pub struct ShmGlobalHeader {
     pub daemon_pid: u32,
     /// Engine PID.
     pub engine_pid: u32,
-    // 24 bytes used, pad to 64 for active_tool_processes alignment
-    _pad_atp: [u8; 40],
+    /// Atomic bitmask of active stream leases (bits 0..7 for streams 0..7).
+    pub active_stream_mask: AtomicU32,
+    // 28 bytes used (24 + 4), pad to 64 for active_tool_processes alignment (36 bytes)
+    _pad_atp: [u8; 36],
     /// Immediate process spawn hook: tool process counter.
     pub active_tool_processes: AtomicU32,
     // 4 bytes for AtomicU32, pad to 64 for cuda_yield_mode alignment
@@ -815,5 +853,168 @@ impl Default for ToolSpawnGuard {
 impl Drop for ToolSpawnGuard {
     fn drop(&mut self) {
         tool_process_completed();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stream Lease Registry & RAII Guard
+// ---------------------------------------------------------------------------
+
+impl ShmHandle {
+    /// Attempts to acquire an exclusive stream lease slot in 0..7.
+    ///
+    /// Returns `Some(slot_id)` if acquired, or `None` if all 8 slots are busy.
+    pub fn acquire_stream_slot(&self) -> Option<u32> {
+        let global_hdr = self.header();
+        for _ in 0..100 {
+            let current_mask = global_hdr.active_stream_mask.load(Ordering::Relaxed);
+            let mut free_slot = None;
+            for i in 0..8 {
+                if (current_mask & (1 << i)) == 0 {
+                    free_slot = Some(i);
+                    break;
+                }
+            }
+            let slot = free_slot?;
+            let new_mask = current_mask | (1 << slot);
+            if global_hdr
+                .active_stream_mask
+                .compare_exchange_weak(current_mask, new_mask, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Some(slot);
+            }
+        }
+        None
+    }
+
+    /// Releases a previously acquired stream slot.
+    pub fn release_stream_slot(&self, slot: u32) {
+        if slot < 8 {
+            let global_hdr = self.header();
+            global_hdr
+                .active_stream_mask
+                .fetch_and(!(1 << slot), Ordering::AcqRel);
+            // Submit an explicit MSG_RELEASE_STREAM frame to prompt engine KV page cache eviction
+            let _ =
+                self.write_request_frame(MessageType::ReleaseStream, FrameFlags::NONE, slot, &[]);
+        }
+    }
+
+    /// Checks if a stream slot is currently active.
+    #[must_use]
+    pub fn is_slot_active(&self, slot: u32) -> bool {
+        if slot >= 8 {
+            return false;
+        }
+        (self.header().active_stream_mask.load(Ordering::Relaxed) & (1 << slot)) != 0
+    }
+
+    /// Submits a pre-tokenized binary token generation request directly into the request queue.
+    ///
+    /// Copies directly into the shared memory ring buffer without any heap allocations.
+    pub fn write_generate_tokens_request(
+        &self,
+        stream_id: u32,
+        tokens: &[u32],
+        max_tokens: u32,
+        temperature: f32,
+        top_p: f32,
+        stop_tokens: &[u32],
+    ) -> Result<(), IpcError> {
+        let mut req = GenerateTokensRequest {
+            stream_id,
+            num_tokens: tokens.len() as u32,
+            max_tokens,
+            temperature,
+            top_p,
+            stop_token_count: stop_tokens.len().min(16) as u32,
+            stop_tokens: [0; 16],
+        };
+        for (i, &st) in stop_tokens.iter().take(16).enumerate() {
+            req.stop_tokens[i] = st;
+        }
+
+        let hdr = self.header();
+        let payload_size = GENERATE_TOKENS_REQUEST_SIZE + std::mem::size_of_val(tokens);
+        let total = FRAME_HEADER_SIZE + payload_size;
+
+        let capacity = hdr.request_queue.capacity_bytes as usize;
+        if total > capacity / 2 {
+            return Err(IpcError::BadFrame(format!(
+                "frame too large: {total} bytes exceeds half the {capacity}-byte request queue"
+            )));
+        }
+
+        let head = hdr.request_queue.head.load(Ordering::Acquire);
+        let seq = hdr.request_queue.total_frames_written;
+
+        let frame = IpcFrameHeader {
+            magic: IPC_MAGIC,
+            msg_type: MessageType::GenerateTokensRequest as u16,
+            flags: FrameFlags::NONE,
+            stream_id,
+            payload_size: payload_size as u32,
+            sequence_num: seq,
+            timestamp_ns: monotonic_ns(),
+        };
+
+        let rq_base = self.queue_data_ptr(hdr.request_queue_offset as usize);
+        let mask = hdr.request_queue.mask as usize;
+
+        // SAFETY: Writing directly into mapped ring buffer under SPSC single-producer rules.
+        unsafe {
+            let frame_bytes =
+                std::slice::from_raw_parts((&raw const frame).cast::<u8>(), FRAME_HEADER_SIZE);
+            let req_bytes = std::slice::from_raw_parts(
+                (&raw const req).cast::<u8>(),
+                GENERATE_TOKENS_REQUEST_SIZE,
+            );
+            let token_bytes = std::slice::from_raw_parts(
+                tokens.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(tokens),
+            );
+
+            self.ring_write(rq_base, mask, head as usize, frame_bytes);
+            self.ring_write(rq_base, mask, head as usize + FRAME_HEADER_SIZE, req_bytes);
+            self.ring_write(
+                rq_base,
+                mask,
+                head as usize + FRAME_HEADER_SIZE + GENERATE_TOKENS_REQUEST_SIZE,
+                token_bytes,
+            );
+        }
+
+        hdr.request_queue
+            .head
+            .store(head + total as u64, Ordering::Release);
+
+        Ok(())
+    }
+}
+
+/// RAII guard that automatically releases an acquired stream lease slot on drop.
+pub struct StreamLeaseGuard<'a> {
+    shm: &'a ShmHandle,
+    slot: u32,
+}
+
+impl<'a> StreamLeaseGuard<'a> {
+    /// Acquires a new stream lease from the shared memory header.
+    #[must_use]
+    pub fn acquire(shm: &'a ShmHandle) -> Option<Self> {
+        shm.acquire_stream_slot().map(|slot| Self { shm, slot })
+    }
+
+    /// The acquired slot ID (0..7).
+    #[must_use]
+    pub fn slot(&self) -> u32 {
+        self.slot
+    }
+}
+
+impl Drop for StreamLeaseGuard<'_> {
+    fn drop(&mut self) {
+        self.shm.release_stream_slot(self.slot);
     }
 }

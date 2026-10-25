@@ -142,6 +142,17 @@ impl ModelProfile {
     /// Command-line arguments for a launch on `127.0.0.1:port`.
     #[must_use]
     pub fn args(&self, port: u16) -> Vec<String> {
+        if self.backend == Some(ModelBackendKind::Hydrogen) {
+            let mut args = vec![
+                "-m".into(),
+                self.model.display().to_string(),
+                "-c".into(),
+                self.ctx.to_string(),
+            ];
+            args.extend(self.flags.iter().cloned());
+            return args;
+        }
+
         let mut args = vec![
             "-m".into(),
             self.model.display().to_string(),

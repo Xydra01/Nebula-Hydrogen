@@ -78,31 +78,152 @@ fs::path auto_discover_model() {
     return "";
 }
 
-// Simple extractor for last user message or prompt from JSON payload
-std::string extract_prompt_from_json(const std::string& json_str) {
-    if (json_str.empty()) return "Hello from Nebula Hydrogen";
+std::string unescape_json_string(const std::string& str) {
+    std::string out;
+    out.reserve(str.size());
+    for (size_t i = 0; i < str.size(); ++i) {
+        if (str[i] == '\\' && i + 1 < str.size()) {
+            char next = str[i + 1];
+            switch (next) {
+                case 'n': out += '\n'; ++i; break;
+                case 'r': out += '\r'; ++i; break;
+                case 't': out += '\t'; ++i; break;
+                case '"': out += '"'; ++i; break;
+                case '\\': out += '\\'; ++i; break;
+                default: out += str[i]; break;
+            }
+        } else {
+            out += str[i];
+        }
+    }
+    return out;
+}
 
-    // Search for "content" in JSON
-    size_t last_content_pos = json_str.rfind("\"content\"");
-    if (last_content_pos != std::string::npos) {
-        size_t colon_pos = json_str.find(':', last_content_pos + 9);
-        if (colon_pos != std::string::npos) {
-            size_t q1 = json_str.find('"', colon_pos);
-            if (q1 != std::string::npos) {
-                size_t q2 = json_str.find('"', q1 + 1);
-                while (q2 != std::string::npos && json_str[q2 - 1] == '\\') {
-                    q2 = json_str.find('"', q2 + 1);
+std::string extract_chatml_prompt_from_json(const std::string& json_str, const hydrogen::Tokenizer* tokenizer) {
+    if (json_str.empty()) return "<|im_start|>user\nHello from Nebula Hydrogen<|im_end|>\n<|im_start|>assistant\n";
+
+    // 1. Try to parse "messages": [ { "role": "...", "content": "..." }, ... ]
+    size_t msg_key = json_str.find("\"messages\"");
+    if (msg_key != std::string::npos) {
+        size_t array_start = json_str.find('[', msg_key);
+        if (array_start != std::string::npos) {
+            std::vector<hydrogen::ChatMessageInput> messages;
+            size_t cursor = array_start + 1;
+            while (cursor < json_str.size()) {
+                size_t obj_start = json_str.find('{', cursor);
+                size_t array_end = json_str.find(']', cursor);
+                if (obj_start == std::string::npos || (array_end != std::string::npos && obj_start > array_end)) {
+                    break;
                 }
-                if (q2 != std::string::npos) {
-                    std::string extracted = json_str.substr(q1 + 1, q2 - (q1 + 1));
-                    if (!extracted.empty()) {
-                        return extracted;
+
+                // Extract "role"
+                std::string role = "user";
+                size_t role_pos = json_str.find("\"role\"", obj_start);
+                if (role_pos != std::string::npos) {
+                    size_t colon = json_str.find(':', role_pos);
+                    if (colon != std::string::npos) {
+                        size_t q1 = json_str.find('"', colon);
+                        if (q1 != std::string::npos) {
+                            size_t q2 = json_str.find('"', q1 + 1);
+                            if (q2 != std::string::npos) {
+                                role = json_str.substr(q1 + 1, q2 - (q1 + 1));
+                            }
+                        }
+                    }
+                }
+
+                // Extract "content"
+                std::string content;
+                size_t content_pos = json_str.find("\"content\"", obj_start);
+                if (content_pos != std::string::npos) {
+                    size_t colon = json_str.find(':', content_pos);
+                    if (colon != std::string::npos) {
+                        size_t q1 = json_str.find('"', colon);
+                        if (q1 != std::string::npos) {
+                            size_t q2 = q1 + 1;
+                            while (q2 < json_str.size()) {
+                                if (json_str[q2] == '"' && json_str[q2 - 1] != '\\') {
+                                    break;
+                                }
+                                q2++;
+                            }
+                            if (q2 < json_str.size()) {
+                                content = unescape_json_string(json_str.substr(q1 + 1, q2 - (q1 + 1)));
+                            }
+                        }
+                    }
+                }
+
+                if (!content.empty() || role == "assistant") {
+                    messages.push_back({role, content});
+                }
+
+                size_t obj_end = json_str.find('}', obj_start);
+                if (obj_end == std::string::npos) break;
+                cursor = obj_end + 1;
+            }
+
+            if (!messages.empty()) {
+                if (tokenizer != nullptr) {
+                    return tokenizer->format_chatml(messages, true);
+                }
+                std::ostringstream oss;
+                for (const auto& m : messages) {
+                    oss << "<|im_start|>" << m.role << "\n" << m.content << "<|im_end|>\n";
+                }
+                oss << "<|im_start|>assistant\n";
+                return oss.str();
+            }
+        }
+    }
+
+    // 2. Check for direct "prompt" key
+    size_t prompt_pos = json_str.find("\"prompt\"");
+    if (prompt_pos != std::string::npos) {
+        size_t colon = json_str.find(':', prompt_pos);
+        if (colon != std::string::npos) {
+            size_t q1 = json_str.find('"', colon);
+            if (q1 != std::string::npos) {
+                size_t q2 = q1 + 1;
+                while (q2 < json_str.size()) {
+                    if (json_str[q2] == '"' && json_str[q2 - 1] != '\\') break;
+                    q2++;
+                }
+                if (q2 < json_str.size()) {
+                    std::string p = unescape_json_string(json_str.substr(q1 + 1, q2 - (q1 + 1)));
+                    if (!p.empty()) {
+                        if (p.find("<|im_start|>") != std::string::npos) return p;
+                        return "<|im_start|>user\n" + p + "<|im_end|>\n<|im_start|>assistant\n";
                     }
                 }
             }
         }
     }
-    return "The capital of France is";
+
+    // 3. Fallback to extracting last content string
+    size_t last_content = json_str.rfind("\"content\"");
+    if (last_content != std::string::npos) {
+        size_t colon = json_str.find(':', last_content);
+        if (colon != std::string::npos) {
+            size_t q1 = json_str.find('"', colon);
+            if (q1 != std::string::npos) {
+                size_t q2 = q1 + 1;
+                while (q2 < json_str.size()) {
+                    if (json_str[q2] == '"' && json_str[q2 - 1] != '\\') break;
+                    q2++;
+                }
+                if (q2 < json_str.size()) {
+                    std::string p = unescape_json_string(json_str.substr(q1 + 1, q2 - (q1 + 1)));
+                    if (!p.empty()) {
+                        if (p.find("<|im_start|>") != std::string::npos) return p;
+                        return "<|im_start|>user\n" + p + "<|im_end|>\n<|im_start|>assistant\n";
+                    }
+                }
+            }
+        }
+    }
+
+    return "<|im_start|>user\nHello from Nebula Hydrogen<|im_end|>\n<|im_start|>assistant\n";
 }
 
 int extract_int_from_json(const std::string& json_str, const std::string& key, int default_val) {
@@ -222,7 +343,7 @@ int main(int argc, char* argv[]) {
                                  nullptr, 0, req_hdr.sequence_num);
         } else if (req_hdr.msg_type == static_cast<uint16_t>(MessageType::MSG_GENERATE_REQUEST)) {
             std::string req_json(reinterpret_cast<const char*>(payload_buf), req_hdr.payload_size);
-            std::string prompt = extract_prompt_from_json(req_json);
+            std::string prompt = extract_chatml_prompt_from_json(req_json, decoder_ready ? &decoder.tokenizer() : nullptr);
             int max_tokens = extract_int_from_json(req_json, "max_tokens", 256);
             if (max_tokens <= 0) {
                 max_tokens = extract_int_from_json(req_json, "n_predict", 256);
@@ -293,6 +414,42 @@ int main(int argc, char* argv[]) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(15));
                 }
             }
+        } else if (req_hdr.msg_type == static_cast<uint16_t>(MessageType::MSG_GENERATE_TOKENS_REQUEST)) {
+            if (req_hdr.payload_size >= sizeof(GenerateTokensRequest)) {
+                const auto* req = reinterpret_cast<const GenerateTokensRequest*>(payload_buf);
+                const size_t expected_size = sizeof(GenerateTokensRequest) + static_cast<size_t>(req->num_tokens) * sizeof(uint32_t);
+                if (req_hdr.payload_size >= expected_size) {
+                    const auto* token_ptr = reinterpret_cast<const uint32_t*>(payload_buf + sizeof(GenerateTokensRequest));
+                    std::vector<uint32_t> prompt_tokens(token_ptr, token_ptr + req->num_tokens);
+
+                    hydrogen::SamplingConfig sampling;
+                    sampling.temperature = req->temperature;
+                    sampling.top_p = req->top_p;
+                    sampling.min_p = 0.0f;
+                    sampling.repetition_penalty = 1.05f;
+
+                    if (decoder_ready) {
+                        std::cout << "[Hydrogen] Binary token generation stream_id=" << req->stream_id
+                                  << " num_tokens=" << req->num_tokens << " max_tokens=" << req->max_tokens << "\n" << std::flush;
+                        decoder.generate(prompt_tokens, req->max_tokens, server, req->stream_id, sampling,
+                                         /*reset_state=*/true, nullptr, req->stop_tokens, req->stop_token_count);
+                    } else {
+                        // Dummy stream for tests without weights
+                        for (uint32_t i = 0; i < std::min<uint32_t>(req->max_tokens, 4); ++i) {
+                            bool is_final = (i + 1 == std::min<uint32_t>(req->max_tokens, 4));
+                            server.send_token(req->stream_id, 1000 + i, 1.0f, " tok", is_final);
+                        }
+                    }
+                }
+            }
+        } else if (req_hdr.msg_type == static_cast<uint16_t>(MessageType::MSG_RELEASE_STREAM)) {
+            uint32_t stream_slot = req_hdr.stream_id % 8;
+            if (decoder_ready) {
+                decoder.release_stream_slot(stream_slot);
+            }
+            server.release_stream_slot(stream_slot);
+            server.send_response(MessageType::MSG_RELEASE_STREAM, req_hdr.stream_id, FrameFlags::NONE,
+                                 nullptr, 0, req_hdr.sequence_num);
         } else if (req_hdr.msg_type == static_cast<uint16_t>(MessageType::MSG_TERMINATE_ENGINE)) {
             std::cout << "[Hydrogen] Received terminate signal from daemon.\n" << std::flush;
             break;

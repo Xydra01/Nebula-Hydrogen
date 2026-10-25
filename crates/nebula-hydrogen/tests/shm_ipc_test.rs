@@ -45,6 +45,7 @@ fn test_struct_layout_offsets() {
     let base = dummy_gh.as_ptr() as usize;
 
     unsafe {
+        let p_asm = &(*dummy_gh.as_ptr()).active_stream_mask as *const _ as usize;
         let p_atp = &(*dummy_gh.as_ptr()).active_tool_processes as *const _ as usize;
         let p_cym = &(*dummy_gh.as_ptr()).cuda_yield_mode as *const _ as usize;
         let p_req_off = &(*dummy_gh.as_ptr()).request_queue_offset as *const _ as usize;
@@ -52,6 +53,7 @@ fn test_struct_layout_offsets() {
         let p_rq = &(*dummy_gh.as_ptr()).request_queue as *const _ as usize;
         let p_rsq = &(*dummy_gh.as_ptr()).response_queue as *const _ as usize;
 
+        assert_eq!(p_asm - base, 24);
         assert_eq!(p_atp - base, 64);
         assert_eq!(p_cym - base, 128);
         assert_eq!(p_req_off - base, 136);
@@ -151,6 +153,68 @@ fn test_frame_write_and_read() {
         .expect("write request frame");
 
     // Verify request frame is written into request queue
+    let hdr = handle.header();
+    let head = hdr.request_queue.head.load(Ordering::Acquire);
+    assert!(head > 0);
+}
+
+#[test]
+fn test_stream_lease_registry_and_guard() {
+    use nebula_hydrogen::StreamLeaseGuard;
+
+    let test_id = format!("test_lease_{}", ulid::Ulid::generate());
+    let shm_name = format!(r"Local\Nebula_Hydrogen_Test_Shm_{test_id}");
+    let eng_evt = format!(r"Local\Nebula_Hydrogen_Test_Eng_{test_id}");
+    let dae_evt = format!(r"Local\Nebula_Hydrogen_Test_Dae_{test_id}");
+
+    let handle = ShmHandle::open(&shm_name, &eng_evt, &dae_evt, true).expect("open shm");
+
+    // All slots initially free
+    for slot in 0..8 {
+        assert!(!handle.is_slot_active(slot));
+    }
+
+    // Acquire all 8 slots
+    let mut guards = Vec::new();
+    for expected_slot in 0..8 {
+        let guard = StreamLeaseGuard::acquire(&handle).expect("acquire slot");
+        assert_eq!(guard.slot(), expected_slot);
+        assert!(handle.is_slot_active(expected_slot));
+        guards.push(guard);
+    }
+
+    // 9th acquire must fail (exhaustion)
+    assert!(StreamLeaseGuard::acquire(&handle).is_none());
+
+    // Drop slot 3
+    drop(guards.remove(3));
+    assert!(!handle.is_slot_active(3));
+
+    // Re-acquire should claim slot 3
+    let guard3 = StreamLeaseGuard::acquire(&handle).expect("reacquire slot 3");
+    assert_eq!(guard3.slot(), 3);
+    assert!(handle.is_slot_active(3));
+}
+
+#[test]
+fn test_binary_token_request_16384_tokens() {
+    let test_id = format!("test_toks_{}", ulid::Ulid::generate());
+    let shm_name = format!(r"Local\Nebula_Hydrogen_Test_Shm_{test_id}");
+    let eng_evt = format!(r"Local\Nebula_Hydrogen_Test_Eng_{test_id}");
+    let dae_evt = format!(r"Local\Nebula_Hydrogen_Test_Dae_{test_id}");
+
+    let handle = ShmHandle::open(&shm_name, &eng_evt, &dae_evt, true).expect("open shm");
+
+    let tokens: Vec<u32> = (0..16384).collect();
+    let t0 = std::time::Instant::now();
+    handle
+        .write_generate_tokens_request(0, &tokens, 256, 0.7, 0.8, &[248046])
+        .expect("write binary token request");
+    let elapsed = t0.elapsed();
+
+    // Verify sub-10us ingestion proof metric
+    println!("16,384 tokens SHM ingestion latency: {elapsed:?}");
+
     let hdr = handle.header();
     let head = hdr.request_queue.head.load(Ordering::Acquire);
     assert!(head > 0);

@@ -14,8 +14,8 @@ While traditional local runtimes (such as `llama.cpp`) are optimized for sequent
 | **Attention Kernel** | FlashInfer SM 8.9 Cascade Attention | **6.68x aggregate throughput** (565 tok/s batched) |
 | **Batch Scheduling** | Split-Fuse continuous batching (chunks $\le 64$ tok) | **Zero perceptible decode stutter** during 1.5K prefills |
 | **Tool Grammar** | GPU-Fused Finite State Machine (FSM) bitmasks | **$1.5\ \mu\text{s}$ schema validation** directly in SRAM |
-| **Host Swapping** | Host-pinned mapped slab with tiered fallback | **$6.1\text{ ms}$ leaf swap** over PCIe 4.0 x16 |
-| **Daemon Interface**| Zero-copy Win32 Named Shared Memory IPC | **$<50\ \mu\text{s}$ token signaling** without TCP/HTTP |
+| **Host Swapping** | Host-pinned mapped slab with tiered fallback | **$13.0\text{ ms}$ empirical leaf swap** ($12.0\text{ GB/s}$ physical; $6.5\text{ ms}$ norm PCIe 4.0) |
+| **Daemon Interface**| Zero-copy Win32 Named Shared Memory IPC | **$<50\ \mu\text{s}$ token signaling** ($8.15\ \mu\text{s}$ measured, $5.89\text{M tok/s}$) |
 
 ---
 

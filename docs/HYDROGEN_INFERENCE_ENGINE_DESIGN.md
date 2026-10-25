@@ -466,6 +466,50 @@ In [`docs/RECURSIVE_SELF_IMPROVEMENT_HARNESS.md`](file:///F:/Users/myfri/Project
 - Under `llama.cpp`, memory constraints forced serial pipelined probing ($4k$ runs taking 3–5 minutes).
 - Under **Hydrogen**, because all $2k$ candidate probes share the 4K-token workspace prefix, Hydrogen executes **all 4 to 8 candidate probes simultaneously in a single batched forward pass**, completing the entire recursive evaluation in **~35 seconds** without exceeding 3.5 GB of KV memory!
 
+### 5.3 Nebula Production Alignment: 5 Strategic Realignment Pivots
+
+An audit of [`crates/nebula-daemon/src/executor.rs`](file:///F:/Users/myfri/Project%20Neutron/crates/nebula-daemon/src/executor.rs), [`crates/nebula-model/src/supervisor.rs`](file:///F:/Users/myfri/Project%20Neutron/crates/nebula-model/src/supervisor.rs), and `crates/nebula-tools` reveals that Nebula was originally architected around single-user, sequential `llama-server` constraints. To exploit Hydrogen's native engine capabilities, Nebula's development path is realigned across 5 core areas:
+
+```mermaid
+graph TD
+    A["Nebula Production Daemon"] --> B["Pivot 1: Speculative Rollouts via Radix KV"]
+    A --> C["Pivot 2: Zero-Copy Win32 Shared Memory"]
+    A --> D["Pivot 3: GPU-Fused FSM Grammar Bitmasks"]
+    A --> E["Pivot 4: Tool-Spawn CUDA Yield Seam"]
+    A --> F["Pivot 5: WDDM-Safe Continuous Batching"]
+    
+    B --> B1["8 Concurrent Candidates with 84.8% VRAM Savings"]
+    C --> C1["Sub-50us Inter-Process Token Signaling"]
+    D --> D1["Zero JSON Parsing Errors Directly in SRAM"]
+    E --> E1["Automatic GPU Preemption During cargo test"]
+    F --> F1["Sub-15ms Prefill Slices Below 2000ms TDR Ceiling"]
+```
+
+#### Pivot 1: Speculative Multi-Agent Branching via Radix Prefix Deduplication
+- **Current Nebula Architecture**: In `crates/nebula-daemon/src/executor.rs`, `run_task()` executes a single sequential loop. If a task hits a dead-end, it must roll back sequentially.
+- **The Hydrogen Advantage**: Hydrogen's Radix-Tree KV cache (`hydrogen/src/memory/radix_tree.cpp`) provides $84.8\%$ memory deduplication (measured in Test 10: $320\text{ MB}$ vs $2,112\text{ MB}$ for 8 streams sharing a 4K prefix).
+- **Development Realignment**: Upgrade `nebula task` to support speculative candidate exploration (Harness²). Rather than testing one fix at a time, Nebula can spawn 4 parallel worktrees (`wt-candidate-0..3`), evaluate different diff strategies concurrently on Hydrogen across stream slots $0..3$ without duplicating the system prompt or repository map in VRAM, and merge the first candidate that passes tests.
+
+#### Pivot 2: Zero-Copy IPC Transport (`HydrogenBackend` Default)
+- **Current Nebula Architecture**: Nebula's default profile (`standard`) runs over HTTP SSE via `LlamaServerBackend`. Every token incurs TCP socket packaging, HTTP header parsing, and string copies ($5\text{–}15\text{ ms}$ latency).
+- **The Hydrogen Advantage**: `crates/nebula-model/src/hydrogen.rs` uses a 64 MiB Win32 Named Shared Memory section with OS event signaling. Measured latency in `hydrogen_bench_shm_ipc.exe` is $8.15\ \mu\text{s}$ average ($17.5\ \mu\text{s}$ p99) with $5.89\text{M tokens/s}$ zero-copy throughput ($523\times$ faster than HTTP SSE).
+- **Development Realignment**: Deprecate HTTP SSE for local model serving. Promote `HydrogenBackend` to the default model communication transport, eliminating network sockets and port collisions entirely.
+
+#### Pivot 3: GPU-Fused FSM Grammar Constraints for Tool Calls
+- **Current Nebula Architecture**: In `crates/nebula-daemon/src/executor.rs`, model outputs are parsed on the CPU with string search / JSON serde. If the model emits trailing commas or invalid markdown wrappers, tool extraction fails and triggers repair turns.
+- **The Hydrogen Advantage**: Hydrogen's on-device FSM sampler (`hydrogen/src/grammar/fsm_sampler.cu`) enforces schema bitmasks directly in GPU SRAM in $0.956\ \mu\text{s}$ per token, achieving $100.00\%$ schema conformity across 10,000 tool calls with 0 JSON syntax errors.
+- **Development Realignment**: When `executor.rs` provisions tools (`fs.read`, `fs.write`, `shell.run`, `git.*`), pass the JSON schema directly in the `ChatRequest`. Hydrogen's IPC transport emits native `MessageType::MSG_TOOL_CALL` frames, removing CPU-side JSON repair loops.
+
+#### Pivot 4: Automatic Tool-Spawn CUDA Preemption (`ToolSpawnGuard`)
+- **Current Nebula Architecture**: When `executor.rs` executes `shell.run` (e.g., `cargo test` or `ninja`), compiling code consumes CPU, RAM, and potentially GPU VRAM if running graphics/compute tests, competing with the background model server.
+- **The Hydrogen Advantage**: In `crates/nebula-tools/src/builtins/task_job_seam.rs`, `ToolSpawnGuard` atomically increments `active_tool_processes` in the shared memory header. In `hydrogen/src/server_main.cpp`, Hydrogen polls this counter and automatically switches to `cudaDeviceScheduleYield`, backing off CUDA execution so child tool processes get full CPU/memory priority.
+- **Development Realignment**: Tighten the integration: when a tool process is active, Hydrogen not only yields CUDA polling but immediately initiates DMA eviction of the idle stream's private leaf ($160\text{ MB}$ swapped in $13.0\text{ ms}$ over physical PCIe 3.0), freeing physical VRAM for heavy child processes.
+
+#### Pivot 5: WDDM Quantum-Safe Continuous Scheduling
+- **Current Nebula Architecture**: Under heavy load, large tool observations (>2,000 tokens of test logs) sent to `llama-server` cause compute spikes that freeze the Windows UI desktop.
+- **The Hydrogen Advantage**: Hydrogen's Split-Fuse continuous batcher (`hydrogen/src/batcher/split_fuse.cu`) clamps prefills to $M \le 64$ tokens per continuous step. In live benchmark testing, decode jitter was measured at $3.2\%$ during a 1.5K prefill burst, with max step latency $14.53\text{ ms}$—well below the 2,000 ms Windows WDDM TDR ceiling.
+- **Development Realignment**: Configure Nebula's background game-mode detection (`crates/nebula-daemon/src/game_mode.rs`) to co-exist with Hydrogen. Instead of completely halting inference during gaming or graphics workloads, Hydrogen's clamped $14\text{ ms}$ execution quantum allows agent tasks to run continuously in the background without UI lag or frame drops.
+
 ---
 
 ## 6. Implementation Strategy & Kernel Selection
@@ -514,6 +558,15 @@ Reviewing this architecture from an adversarial, zero-assumption perspective, th
 9. **WDDM Virtual Address Ceiling vs. Physical Commit Space**:
    - *Risk*: On Windows developer workstations configured with small or disabled pagefiles, calling `cudaHostAlloc` with `cudaHostAllocMapped` creates a virtual address space reservation that locks physical RAM while consuming from the system commit limit. If parallel build workloads (`cargo build -j 16`, `cl.exe`, `rustc.exe`) burst simultaneously, total system commit charge can exhaust available commit space, triggering Windows Error 1455 (`ERROR_COMMITMENT_LIMIT`) and crashing active processes.
    - *Mitigation (Section 3.6)*: Strictly enforce the 4 GB pinned ceiling in `config/default.toml` (`[engine.swap] max_pinned_bytes = 4_294_967_296`), capping pinned host memory to 12.5% of total 32 GB RAM. This guarantees at least **23.5 GB of uncommitted RAM** permanently remains available for OS pagefile backing and compiler processes.
+10. **Large Multi-turn Message Serialization Overhead (IPC JSON Tax)**:
+    - *Risk*: `extract_chatml_prompt_from_json()` in `server_main.cpp` parses JSON with manual string scanning. For large context histories (e.g. 100K characters of tool outputs and multi-turn conversations), this CPU string scanning consumes $1\text{–}3\text{ ms}$ on the CPU, re-introducing serialization overhead.
+    - *Mitigation*: Replace JSON string scanning in IPC request handling with structured binary token array frames directly from Rust (`crates/nebula-hydrogen`) into the shared memory request ring, eliminating CPU-side JSON parsing entirely.
+11. **Stream Slot Collision Under High Task Churn**:
+    - *Risk*: In `NativeDecoder::generate()`, stream slot assignment via naive `stream_id % MAX_STREAMS` causes slot collisions when `nebula-daemon` spawns tasks with monotonically increasing stream IDs. If an earlier stream is still resident in the page pool or host swap, its KV pages are stomped or orphaned.
+    - *Mitigation*: Implement an explicit stream-lease registry in Hydrogen's batcher to track active slot occupancy, explicitly recycle or evict resident KV pages on release, and reject or queue requests when all physical slots are leased.
+12. **The Autoregressive Recurrence Implementation Gap (CRITICAL BLOCKER)**:
+    - *Risk*: While single-token baseline GEMV and IPC transport function, `native_decoder.cu`'s `kernel_ssm_step` uses a toy placeholder recurrence (`new_s = prev_s * 0.95f + u * 0.05f`) instead of the true Qwen 3.5 SSM state equations. Attention layers omit RoPE, and `attn_q_norm`/`attn_k_norm` are loaded but uninvoked in `forward_token()`, causing autoregressive multi-token generation across full 64 layers to output garbled subwords (`raelramereetíomaticadesewise...`).
+    - *Mitigation*: Prioritize Issue H19-B as the immediate top development blocker: implement exact 1D causal depthwise convolution (`ssm_conv1d`), time-step $\Delta t$ projection, discretized state matrix $A$, input/output projections $B/C$, group norm (`ssm_norm`), QK RMSNorm (`attn_q_norm`, `attn_k_norm`), and Rotary Position Embeddings (RoPE) directly in `native_decoder.cu`.
 
 ---
 

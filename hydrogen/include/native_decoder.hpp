@@ -125,6 +125,35 @@ public:
         const uint32_t* d_grammar_bitmask = nullptr
     );
 
+    // Pre-tokenized binary token generation (bypasses CPU BPE tokenizer)
+    void generate(
+        const std::vector<uint32_t>& prompt_tokens,
+        int max_tokens,
+        const TokenCallback& on_token,
+        const SamplingConfig& sampling = SamplingConfig{},
+        uint32_t stream_id = 0,
+        bool reset_state = true,
+        const uint32_t* d_grammar_bitmask = nullptr,
+        const ToolCallCallback& on_tool_call = nullptr,
+        const uint32_t* stop_tokens = nullptr,
+        uint32_t stop_token_count = 0
+    );
+
+    void generate(
+        const std::vector<uint32_t>& prompt_tokens,
+        int max_tokens,
+        ipc::ShmServer& server,
+        uint32_t stream_id,
+        const SamplingConfig& sampling = SamplingConfig{},
+        bool reset_state = true,
+        const uint32_t* d_grammar_bitmask = nullptr,
+        const uint32_t* stop_tokens = nullptr,
+        uint32_t stop_token_count = 0
+    );
+
+    // Stream-Lease slot eviction and state reset
+    void release_stream_slot(uint32_t stream_slot);
+
     // Tokenizer & Detokenizer access
     Tokenizer& tokenizer() noexcept { return tokenizer_; }
     [[nodiscard]] const Tokenizer& tokenizer() const noexcept { return tokenizer_; }
@@ -207,6 +236,8 @@ private:
     float* d_x_norm_ = nullptr;        // [5120]
     float* d_res_ = nullptr;           // [5120]
     float* d_q_ = nullptr;             // [12288]
+    float* d_q_heads_ = nullptr;       // [6144]
+    float* d_attn_gate_ = nullptr;     // [6144]
     float* d_k_ = nullptr;             // [1024]
     float* d_v_ = nullptr;             // [1024]
     float* d_attn_out_ = nullptr;      // [6144]
@@ -220,7 +251,12 @@ private:
     // Multi-Stream KV Cache & SSM States
     float* d_k_cache_ = nullptr;       // [MAX_STREAMS * 16 * MAX_SEQ_LEN * 4 * 256]
     float* d_v_cache_ = nullptr;       // [MAX_STREAMS * 16 * MAX_SEQ_LEN * 4 * 256]
-    float* d_ssm_state_ = nullptr;     // [MAX_STREAMS * 48 * ssm_inner_]
+    float* d_ssm_state_ = nullptr;     // [MAX_STREAMS * 48 layers * 48 heads * 128 * 128 (Gated DeltaNet matrix memory)]
+    float* d_ssm_conv_state_ = nullptr;// [MAX_STREAMS * 48 * 4 * 10240]
+    float* d_conv_out_ = nullptr;      // [10240]
+    float* d_decay_ = nullptr;         // [48]
+    float* d_beta_ = nullptr;          // [48]
+    float* d_attn_core_ = nullptr;     // [6144]
     uint32_t stream_seq_pos_[MAX_STREAMS] = {0};
 
     // Grammar Mask Buffer (Device)

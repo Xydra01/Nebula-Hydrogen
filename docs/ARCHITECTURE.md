@@ -8,7 +8,8 @@ A guide to what exists in the repo **today**: where things are and how they fit 
 flowchart LR
   CLI["nebula (nebula-cli)"] -->|"JSON-RPC over \\.\pipe\nebula (ADR-007)"| D["nebula-daemon"]
   D --> MM["ModelManager (nebula-model)"]
-  MM -->|"Job Object, HTTP + SSE"| LS["llama-server: chat profile (GPU)"]
+  MM -->|"Win32 Shared Memory (Local\Nebula_Hydrogen_IPC)"| HY["hydrogen_engine (GPU C++20/CUDA)"]
+  MM -->|"Job Object, HTTP + SSE (fallback)"| LS["llama-server: chat profile (GPU)"]
   MM -->|"Job Object, HTTP"| ES["llama-server: embedding (CPU)"]
   D --> RS["Resource sampler + doctor (nebula-resources)"]
   D --> T["Telemetry (nebula-telemetry)"]
@@ -18,9 +19,9 @@ flowchart LR
 ```
 
 - **One daemon per machine**, started by `nebula daemon start` (detached). It owns the model servers, samples resources every 2 s, writes structured logs, and serves the CLI over a named pipe that only the current user can open.
-- **The model** runs as `llama-server.exe` child processes inside a Windows Job Object. If the daemon dies, they die too. The supervisor restarts a crashed server with backoff and switches profiles on request.
+- **The model** runs as either the native `hydrogen_engine.exe` (communicating over a 64 MiB zero-copy Win32 Named Shared Memory section with sub-50 µs event signaling) or `llama-server.exe` child processes inside a Windows Job Object. If the daemon dies, they die too. The supervisor restarts a crashed server with backoff and switches profiles on request.
 - **The CLI** is a thin client. `doctor` and `resources` fall back to local checks when the daemon is down. `backup` runs in the CLI process, without the daemon.
-- **Phase 1** adds the agent itself: tools over MCP, permission tiers, worktrees, an executor loop and a TUI. See the GitHub issues labelled `phase-1`.
+- **Phase 1 & Strategic Realignment** adds the agent itself: tools over MCP, permission tiers, worktrees, an executor loop and a TUI, realigned across 5 strategic pivots (speculative multi-agent branching via Radix KV deduplication, default zero-copy shared memory IPC, GPU-fused FSM schema constraints, tool-spawn CUDA yield seam, and WDDM quantum-safe continuous scheduling). See [HYDROGEN_INFERENCE_ENGINE_DESIGN.md](HYDROGEN_INFERENCE_ENGINE_DESIGN.md#53-nebula-production-alignment-5-strategic-realignment-pivots) and the GitHub issues.
 
 ## Crates (`crates/`)
 
@@ -50,7 +51,8 @@ Binaries: `nebula.exe` (from `nebula-cli`) and `nebula-daemon.exe` (from `nebula
 | Add a config key | `config/default.toml` and the struct in `nebula-config/src/lib.rs` (unknown keys fail) |
 | Change a command's permission tier | `nebula-sandbox/src/data/rules.toml` (the embedded rules table; editing it needs a rebuild/reinstall), the engine in `nebula-sandbox/src/engine.rs`, and the red-team fixture `data/red_team.toml`. Protected set — human-reviewed |
 | Change the per-task worktree lifecycle | `nebula-sandbox/src/worktree/` (the `WorktreeManager` and its `create`/`finalize`/`remove_worktree`/`recover_stale` in `manager.rs`, the `Delete_Limit` gate in `measure.rs`); the per-task confinement provider `TaskWorktreeProvider` + `CURRENT_WORKTREE` task-local in `nebula-tools`; the daemon wiring (recovery at start, provider install) in `nebula-daemon/src/builtin_providers.rs`. Protected set — human-reviewed |
-| Model launch flags and profiles | `[model.profiles.*]` in `config/default.toml`, turned into `llama-server` arguments by `ModelProfile::args` in `nebula-model/src/config.rs` |
+| Model launch flags and profiles | `[model.profiles.*]` in `config/default.toml`, turned into `llama-server` or `hydrogen_engine` arguments by `ModelProfile::args` in `nebula-model/src/config.rs` |
+| Native Hydrogen engine & shared memory IPC | Model backend in `crates/nebula-model/src/hydrogen.rs`, safe FFI in `crates/nebula-hydrogen/src/`, C++20/CUDA engine in `hydrogen/src/` |
 | Restart and backoff behaviour | `nebula-model/src/supervisor.rs` |
 | What gets logged and redacted | `nebula-telemetry/src/layer.rs`, `redact.rs`; the secret targets are `daemon.secrets` in config |
 | CLI output format | `nebula-cli/src/format.rs` (snapshot-tested in `tests/snapshots/`) |
@@ -125,6 +127,7 @@ From [ADR-004](adr/ADR-004-model-profiles.md), [ADR-005](adr/ADR-005-fallback-mo
 | [PROMPT_TRANSLATION_ROSETTA_STONE.md](PROMPT_TRANSLATION_ROSETTA_STONE.md) | Prompt translation layer and execution invariants: exit directives, completion barriers, and dependency gate contracts |
 | [HYDROGEN_INFERENCE_ENGINE_DESIGN.md](HYDROGEN_INFERENCE_ENGINE_DESIGN.md) | Project Hydrogen inference engine specification: agent-native Radix-Paged KV cache, Cascade Attention, Split-Fuse batching, in-engine tool dispatch, and host-pinned DMA swapping for single-GPU RTX 4070 |
 | [HYDROGEN_ELI5_EXPLAINER.md](HYDROGEN_ELI5_EXPLAINER.md) | Plain-English (ELI5) architectural guide to Project Hydrogen: intuitive analogies for Radix-Paged KV cache, Cascade Attention, Split-Fuse batching, host swapping, and Windows WDDM hardening |
+| [WORK_ORDER.md](WORK_ORDER.md) | Master Execution Work Order & Issue Dependency Roadmap: Tier 0 blockers (SSM/RoPE, binary IPC, batched GEMM), Tier 1 safety, Tier 2 realignment pivots, Tier 3 language modules, Tier 4 evals/ops |
 | [PHASE0_PLAN.md](PHASE0_PLAN.md) | You want what Phase 0 built and why. Look for the "As built" notes under each workstream; Section 9 has the exit criteria |
 | [adr/](adr/README.md) | You're about to change a decision: model profiles, fallback, MTP, IPC framing, Rust/Python split, MCP boundary |
 | [ops/setup.md](ops/setup.md) | You're rebuilding the machine, or need to know how something was installed |
