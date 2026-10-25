@@ -42,9 +42,28 @@ pub struct TaskRunArgs {
     /// Target language module identifier (e.g. "python", "cpp", "sql").
     #[arg(long = "lang")]
     pub language: Option<String>,
+    /// Optional Python runtime version constraint (e.g. "3.11", "3.12").
+    #[arg(long = "python-version")]
+    pub python_version: Option<String>,
     /// Optional observable verification command target (e.g. "pytest" or "test.run").
     #[arg(long)]
     pub verification_target: Option<String>,
+}
+
+/// Heuristically detects the workspace language from repository manifest files.
+fn detect_workspace_language(repo: &std::path::Path) -> Option<String> {
+    if repo.join("Cargo.toml").is_file() {
+        Some("rust".into())
+    } else if repo.join("pyproject.toml").is_file() || repo.join("requirements.txt").is_file() {
+        Some("python".into())
+    } else if repo.join("CMakeLists.txt").is_file() || repo.join("compile_commands.json").is_file()
+    {
+        Some("cpp".into())
+    } else if repo.join("schema.sql").is_file() {
+        Some("sql".into())
+    } else {
+        None
+    }
 }
 
 /// Run an autonomous task to completion, streaming steps.
@@ -62,6 +81,17 @@ pub(crate) async fn run(ctx: &Ctx, args: &TaskRunArgs, out: &mut dyn Write) -> a
         None
     };
 
+    let language = args
+        .language
+        .clone()
+        .or_else(|| detect_workspace_language(&repo));
+
+    let language_config = args.python_version.as_ref().map(|pv| {
+        serde_json::json!({
+            "python_version": pv
+        })
+    });
+
     let mut c = connect(ctx).await?;
     let params = TaskCreateParams {
         goal: args.goal.clone(),
@@ -72,8 +102,8 @@ pub(crate) async fn run(ctx: &Ctx, args: &TaskRunArgs, out: &mut dyn Write) -> a
         max_tokens: args.max_tokens,
         wall_time_secs: args.wall_time_secs,
         create_pr,
-        language: args.language.clone(),
-        language_config: None,
+        language,
+        language_config,
         verification_target: args.verification_target.clone(),
     };
 

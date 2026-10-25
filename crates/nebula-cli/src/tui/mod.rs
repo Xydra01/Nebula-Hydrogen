@@ -5,6 +5,8 @@ pub mod event;
 pub mod terminal;
 pub mod ui;
 
-pub use app::{ActivePane, TaskItem, ToolCallItem, TuiAction, TuiApp, TuiTaskStatus};
+pub use app::{
+    ActivePane, DiagnosticItem, TaskItem, ToolCallItem, TuiAction, TuiApp, TuiTaskStatus,
+};
 pub use event::run_tui;
 pub use ui::render;

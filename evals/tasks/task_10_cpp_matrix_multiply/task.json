@@ -1,0 +1,13 @@
+{
+  "id": "task_10_cpp_matrix_multiply",
+  "name": "C++ GEMM Tiled Cache Refactor",
+  "language": "cpp",
+  "family": "F-refactor",
+  "prompt": "Refactor the naive 3-loop GEMM in src/gemm.cpp to use 2D cache-blocking (tile size 32x32) while preserving exact numerical results and column-major memory layout. Ensure CMake configuration and CTest pass.",
+  "check_command": "ctest --output-on-failure",
+  "limits": {
+    "max_tool_calls": 8,
+    "max_tokens": 4096,
+    "wall_time_secs": 180
+  }
+}

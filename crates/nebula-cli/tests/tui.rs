@@ -93,6 +93,8 @@ fn test_tui_populated_dashboard_layout() {
         status: TuiTaskStatus::Running,
         summary: "Refactor database migrations to use atomic transactions".into(),
         step_count: 3,
+        language: Some("rust".into()),
+        mcp_healthy: true,
     });
 
     app.streaming_text = "Analyzing schema definitions in crates/nebula-db/src/migrations.rs...\nFound 4 migrations requiring transactional boundaries.".into();
@@ -231,4 +233,86 @@ fn test_tui_keyboard_navigation_and_actions() {
     // Quit action
     app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
     assert!(app.should_quit);
+}
+
+#[test]
+fn test_tui_game_mode_banner_layout() {
+    let mut app = TuiApp::new();
+    app.daemon_status = Some(sample_daemon_status());
+    app.resources = Some(sample_resource_snapshot());
+    app.game_mode = Some(GameModeStatusResponse {
+        active: true,
+        manual_override: None,
+        reason: Some("DirectX 12 Game Running".into()),
+        process_name: Some("Cyberpunk2077.exe".into()),
+    });
+
+    let backend = TestBackend::new(120, 32);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|f| nebula_cli::tui::render(&app, f)).unwrap();
+    insta::assert_snapshot!(terminal.backend());
+}
+
+#[test]
+fn test_tui_language_picker_layout() {
+    let mut app = TuiApp::new();
+    app.daemon_status = Some(sample_daemon_status());
+    app.resources = Some(sample_resource_snapshot());
+    app.language_picker_open = true;
+
+    let backend = TestBackend::new(120, 32);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|f| nebula_cli::tui::render(&app, f)).unwrap();
+    insta::assert_snapshot!(terminal.backend());
+}
+
+#[test]
+fn test_tui_diagnostics_modal_layout() {
+    let mut app = TuiApp::new();
+    app.daemon_status = Some(sample_daemon_status());
+    app.resources = Some(sample_resource_snapshot());
+    app.show_diagnostics = true;
+    app.diagnostics.push(nebula_cli::tui::DiagnosticItem {
+        file: "src/main.cpp".into(),
+        line: 42,
+        col: 15,
+        severity: "error".into(),
+        code: Some("C2065".into()),
+        message: "'undeclared_identifier': undeclared identifier".into(),
+    });
+
+    let backend = TestBackend::new(120, 32);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|f| nebula_cli::tui::render(&app, f)).unwrap();
+    insta::assert_snapshot!(terminal.backend());
+}
+
+#[test]
+fn test_tui_language_and_diagnostics_key_handling() {
+    let mut app = TuiApp::new();
+    assert!(!app.language_picker_open);
+    assert!(!app.show_diagnostics);
+
+    // 'l' opens language picker
+    app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+    assert!(app.language_picker_open);
+
+    // down arrow navigates picker
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(app.selected_language_idx, 1);
+
+    // enter selects language
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(!app.language_picker_open);
+    assert_eq!(app.active_language, Some("rust".into()));
+
+    // 'g' toggles diagnostics
+    app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+    assert!(app.show_diagnostics);
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+    assert!(!app.show_diagnostics);
 }

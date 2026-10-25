@@ -3,7 +3,7 @@ source: crates/nebula-cli/tests/tui.rs
 expression: terminal.backend()
 ---
 "╭ Status ──────────────────────────────────────────────────────────────────────────────────────────────────────────────╮"
-"│ Nebula v0.0.1 | Uptime: -- | Model: -- (Offline)                                                                     │"
+"│ Nebula v0.0.1 | Uptime: -- | Model: -- (Offline) | Lang: Auto [MCP: OK]                                              │"
 "╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯"
 "╭ Resources ───────────────────────────────────────────────────────────────────────────────────────────────────────────╮"
 "│VRAM: N/A  |  Commit: N/A  |  GPU: N/A  |  CPU: N/A                                                                   │"
@@ -33,4 +33,4 @@ expression: terminal.backend()
 "│                                              ││                                                                      │"
 "│                                              ││                                                                      │"
 "╰──────────────────────────────────────────────╯╰──────────────────────────────────────────────────────────────────────╯"
-"[q] Quit  [Tab] Cycle Pane  [↑/↓] Navigate/Scroll  [r] Refresh  [a] Approve  [d] Deny                                   "
+"[q] Quit  [Tab] Cycle Pane  [↑/↓] Navigate  [r] Refresh  [l] Language  [g] Diagnostics  [a] Approve  [d] Deny           "

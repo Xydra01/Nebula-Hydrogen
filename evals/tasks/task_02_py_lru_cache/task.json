@@ -1,0 +1,13 @@
+{
+  "id": "task_02_py_lru_cache",
+  "name": "LRU Cache Implementation",
+  "language": "python",
+  "family": "F-feature",
+  "prompt": "Implement an O(1) LRU Cache class in lru_cache.py with __init__(self, capacity: int), get(self, key: int) -> int (returns -1 if missing), and put(self, key: int, value: int) -> None. When capacity is exceeded, evict the least recently used key. Ensure all unit tests in test_lru_cache.py pass.",
+  "check_command": "pytest test_lru_cache.py -q",
+  "limits": {
+    "max_tool_calls": 8,
+    "max_tokens": 4096,
+    "wall_time_secs": 120
+  }
+}
