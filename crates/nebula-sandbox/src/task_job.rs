@@ -289,6 +289,17 @@ impl TaskJob {
             detail: format!("terminate failed: {e}"),
         })
     }
+
+    /// Query the number of currently active processes belonging to this task's job.
+    ///
+    /// # Errors
+    /// [`JobError`] if the OS query fails.
+    pub fn active_processes(&self) -> Result<u32, JobError> {
+        self.job.active_processes().map_err(|e| JobError::Assign {
+            task_id: self.task_id.clone(),
+            detail: format!("query active processes failed: {e}"),
+        })
+    }
 }
 
 /// Installed physical memory in bytes, used to range-check a configured memory cap.
@@ -457,5 +468,42 @@ mod tests {
         let job =
             TaskJob::new("task-mem", limits).expect("an in-range memory limit must build a job");
         assert_eq!(job.limits().memory.unwrap().bytes, 64 * 1024 * 1024);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn active_processes_tracks_and_terminates_children() {
+        use std::os::windows::io::AsRawHandle;
+        use std::process::Command;
+
+        let job = TaskJob::new("task-active-proc", JobLimits::default()).unwrap();
+        assert_eq!(job.active_processes().unwrap(), 0);
+
+        // Spawn a child process and assign to job
+        let mut child = Command::new("cmd")
+            .args(["/C", "ping", "-n", "30", "127.0.0.1"])
+            .spawn()
+            .expect("spawn ping child");
+
+        job.assign(child.as_raw_handle() as _)
+            .expect("assign child to job");
+        let active = job.active_processes().unwrap();
+        assert!(active >= 1, "active processes should be >= 1, got {active}");
+
+        job.terminate().expect("terminate job");
+        // Active processes should drop to 0
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut final_count = u32::MAX;
+        while std::time::Instant::now() < deadline {
+            if let Ok(c) = job.active_processes() {
+                final_count = c;
+                if c == 0 {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(final_count, 0, "processes must drain to 0 after terminate");
+        let _ = child.kill();
     }
 }

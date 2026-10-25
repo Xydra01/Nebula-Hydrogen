@@ -867,23 +867,66 @@ fn arg_present(args: &[String], pattern: &str) -> bool {
 
 /// Collect the target path arguments named by `targets` (Req 2.2).
 ///
-/// - [`PathTargets::AllNonFlag`] → every argument not starting with `-` or `/`;
-/// - [`PathTargets::Indices`] → the arguments at those zero-based positions that are non-flag.
+/// - [`PathTargets::AllNonFlag`] → every non-flag argument, plus paths passed via flag assignment
+///   or attached options (e.g. `--manifest-path=../Cargo.toml`, `-B=C:\evil`, `-BC:\evil`).
+/// - [`PathTargets::Indices`] → the arguments at those zero-based positions.
 fn target_paths(targets: &PathTargets, args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let collect_arg = |arg: &str, out: &mut Vec<String>| {
+        if !is_flag(arg) {
+            out.push(arg.to_owned());
+        } else {
+            // Flag inspection: extract path values passed via flag assignment or attached flag values
+            // (e.g. `--manifest-path=../Cargo.toml`, `-B=C:\evil`, `-BC:\evil`, `--target:../dir`).
+            if let Some((_flag, val)) = arg.split_once('=') {
+                if !val.is_empty() {
+                    out.push(val.to_owned());
+                }
+            } else if let Some((_flag, val)) = arg.split_once(':') {
+                if !val.is_empty() && !arg.starts_with('/') {
+                    out.push(val.to_owned());
+                }
+            } else if arg.starts_with("-B") && arg.len() > 2 {
+                let val = arg[2..].trim_start_matches('=');
+                if !val.is_empty() {
+                    out.push(val.to_owned());
+                }
+            } else if arg.contains("..") || arg.contains('\\') {
+                out.push(arg.to_owned());
+            }
+        }
+    };
+
     match targets {
-        PathTargets::AllNonFlag(_) => args.iter().filter(|arg| !is_flag(arg)).cloned().collect(),
-        PathTargets::Indices(indices) => indices
-            .iter()
-            .filter_map(|&index| args.get(index))
-            .filter(|arg| !is_flag(arg))
-            .cloned()
-            .collect(),
+        PathTargets::AllNonFlag(_) => {
+            for arg in args {
+                collect_arg(arg, &mut out);
+            }
+        }
+        PathTargets::Indices(indices) => {
+            for &index in indices {
+                if let Some(arg) = args.get(index) {
+                    collect_arg(arg, &mut out);
+                }
+            }
+        }
     }
+    out
 }
 
 /// Whether `arg` looks like a flag rather than a path target (starts with `-` or `/`).
+///
+/// Windows-style flags begin with `/` (e.g. `/s`, `/q`, `/fs:ntfs`), but arguments with
+/// multiple segments or directory traversal (e.g. `/`, `/etc/passwd`, `/var/log`) are
+/// path targets, not flags.
 fn is_flag(arg: &str) -> bool {
-    arg.starts_with('-') || arg.starts_with('/')
+    if arg.starts_with('-') {
+        true
+    } else if let Some(rest) = arg.strip_prefix('/') {
+        !rest.is_empty() && !rest.starts_with("..") && !rest.contains('/') && !rest.contains('\\')
+    } else {
+        false
+    }
 }
 
 /// Reconstruct a single command-line string from a command and its arguments, so segmentation and

@@ -829,6 +829,37 @@ async fn execute_loop(
                     .and_then(|v| v.as_str())
                     .unwrap_or("success");
 
+                // Issue #79: Enforce Windows Job Object process barrier before task.finish auto-commit.
+                // Terminate and drain any active child/grandchild processes still running in the task's job.
+                match ctx.task_job.active_processes() {
+                    Ok(active) if active > 0 => {
+                        tracing::warn!(
+                            event = "task.finish_barrier_terminating_children",
+                            task_id = %ctx.task_id,
+                            active_processes = active,
+                            "Terminating active child processes in task job before auto-commit"
+                        );
+                        let _ = ctx.task_job.terminate();
+                        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                        while tokio::time::Instant::now() < deadline {
+                            if let Ok(0) = ctx.task_job.active_processes() {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            event = "task.finish_barrier_query_error",
+                            task_id = %ctx.task_id,
+                            error = %err,
+                            "Could not query active job processes; enforcing safety termination before commit"
+                        );
+                        let _ = ctx.task_job.terminate();
+                    }
+                    _ => {}
+                }
+
                 match commit_worktree_if_dirty(ctx.worktree_root, ctx.goal, &ctx.task_id).await {
                     Ok(_) => {
                         let task_status = if finish_status.eq_ignore_ascii_case("failed") {
