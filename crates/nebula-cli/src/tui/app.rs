@@ -151,6 +151,8 @@ pub struct TuiApp {
     pub streaming_scroll: usize,
     /// Whether streaming text auto-scrolls to the end on new tokens.
     pub auto_scroll: bool,
+    /// Cached line count for streaming text to avoid O(N) line scans on every token.
+    pub streaming_line_count: usize,
     /// Recent tool calls.
     pub tool_calls: VecDeque<ToolCallItem>,
     /// Selected index in tool calls.
@@ -195,6 +197,7 @@ impl Default for TuiApp {
             streaming_text: String::new(),
             streaming_scroll: 0,
             auto_scroll: true,
+            streaming_line_count: 1,
             tool_calls: VecDeque::new(),
             selected_tool_call: 0,
             diagnostics: Vec::new(),
@@ -227,6 +230,39 @@ impl TuiApp {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Returns the number of currently active executor tasks/streams.
+    #[must_use]
+    pub fn active_streams(&self) -> usize {
+        self.tasks
+            .iter()
+            .filter(|t| matches!(t.status, TuiTaskStatus::Running | TuiTaskStatus::Committing))
+            .count()
+    }
+
+    /// Returns the maximum concurrency streams supported by the engine/supervisor.
+    #[must_use]
+    pub const fn max_streams(&self) -> usize {
+        4
+    }
+
+    /// Appends new text to the streaming buffer and updates line count incrementally.
+    pub fn append_streaming_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let new_lines = text.bytes().filter(|&b| b == b'\n').count();
+        self.streaming_line_count += new_lines;
+        self.streaming_text.push_str(text);
+        if self.auto_scroll {
+            self.streaming_scroll = self.streaming_line_count;
+        }
+    }
+
+    /// Syncs `streaming_line_count` from `streaming_text` if modified externally.
+    pub fn sync_streaming_line_count(&mut self) {
+        self.streaming_line_count = self.streaming_text.lines().count().max(1);
     }
 
     /// Handles keyboard input.
@@ -330,8 +366,7 @@ impl TuiApp {
                 }
                 ActivePane::Streaming => {
                     if self.auto_scroll {
-                        let lines = self.streaming_text.lines().count();
-                        self.streaming_scroll = lines;
+                        self.streaming_scroll = self.streaming_line_count;
                         self.auto_scroll = false;
                     }
                     if self.streaming_scroll > 0 {
@@ -352,8 +387,7 @@ impl TuiApp {
                 }
                 ActivePane::Streaming => {
                     self.streaming_scroll += 1;
-                    let lines = self.streaming_text.lines().count();
-                    if self.streaming_scroll >= lines {
+                    if self.streaming_scroll >= self.streaming_line_count {
                         self.auto_scroll = true;
                     }
                 }
@@ -367,16 +401,14 @@ impl TuiApp {
             },
             (KeyCode::PageUp, _) if self.active_pane == ActivePane::Streaming => {
                 if self.auto_scroll {
-                    let lines = self.streaming_text.lines().count();
-                    self.streaming_scroll = lines;
+                    self.streaming_scroll = self.streaming_line_count;
                     self.auto_scroll = false;
                 }
                 self.streaming_scroll = self.streaming_scroll.saturating_sub(10);
             }
             (KeyCode::PageDown, _) if self.active_pane == ActivePane::Streaming => {
                 self.streaming_scroll = self.streaming_scroll.saturating_add(10);
-                let lines = self.streaming_text.lines().count();
-                if self.streaming_scroll >= lines {
+                if self.streaming_scroll >= self.streaming_line_count {
                     self.auto_scroll = true;
                 }
             }
@@ -385,8 +417,7 @@ impl TuiApp {
                 self.auto_scroll = false;
             }
             (KeyCode::End, _) if self.active_pane == ActivePane::Streaming => {
-                let lines = self.streaming_text.lines().count();
-                self.streaming_scroll = lines;
+                self.streaming_scroll = self.streaming_line_count;
                 self.auto_scroll = true;
             }
             _ => {}
@@ -397,8 +428,19 @@ impl TuiApp {
     pub fn handle_event(&mut self, event: Event) {
         match event {
             Event::ChatToken(t) => {
+                let task_id = TaskId::from_ulid(t.chat_id.ulid());
+                if !self.tasks.iter().any(|task| task.id == task_id) {
+                    self.tasks.push(TaskItem {
+                        id: task_id,
+                        status: TuiTaskStatus::Running,
+                        summary: format!("Task {task_id}"),
+                        step_count: 0,
+                        language: self.active_language.clone(),
+                        mcp_healthy: true,
+                    });
+                }
                 if !t.reasoning.is_empty() {
-                    self.streaming_text.push_str(&t.reasoning);
+                    self.append_streaming_text(&t.reasoning);
                 }
                 if !t.text.is_empty() {
                     if t.text.contains("[ERROR]")
@@ -413,10 +455,7 @@ impl TuiApp {
                         tc.status = "ok".into();
                     }
                     extract_diagnostics(&t.text, &mut self.diagnostics);
-                    self.streaming_text.push_str(&t.text);
-                }
-                if self.auto_scroll {
-                    self.streaming_scroll = self.streaming_text.lines().count();
+                    self.append_streaming_text(&t.text);
                 }
             }
             Event::TaskStep(step) => {
@@ -458,13 +497,8 @@ impl TuiApp {
                     } else {
                         "\n"
                     };
-                self.streaming_text.push_str(&format!(
-                    "{prefix}─── Step {} [{}] ───\n",
-                    step.step_index, tools_desc
-                ));
-                if self.auto_scroll {
-                    self.streaming_scroll = self.streaming_text.lines().count();
-                }
+                let banner = format!("{prefix}─── Step {} [{tools_desc}] ───\n", step.step_index);
+                self.append_streaming_text(&banner);
             }
             Event::TaskDone(done) => {
                 let resolved_status = if done.summary.contains("task.finish") {
@@ -511,13 +545,11 @@ impl TuiApp {
                     } else {
                         "\n"
                     };
-                self.streaming_text.push_str(&format!(
+                let banner = format!(
                     "{prefix}═══ Task Done [{:?}] ═══\n{}\n",
                     done.status, done.summary
-                ));
-                if self.auto_scroll {
-                    self.streaming_scroll = self.streaming_text.lines().count();
-                }
+                );
+                self.append_streaming_text(&banner);
             }
             Event::ApprovalNeeded(req) => {
                 let prefix =
@@ -526,15 +558,16 @@ impl TuiApp {
                     } else {
                         "\n"
                     };
-                self.streaming_text.push_str(&format!(
+                let banner = format!(
                     "{prefix}⚠ APPROVAL NEEDED: command '{}' ({})\n",
                     req.command, req.tier
-                ));
-                if self.auto_scroll {
-                    self.streaming_scroll = self.streaming_text.lines().count();
-                }
+                );
+                self.append_streaming_text(&banner);
                 self.pending_approval = Some(req);
                 self.approval_modal_open = true;
+            }
+            Event::ResourcesSnapshot(snap) => {
+                self.update_resources(snap);
             }
             Event::ModelStateChanged(ch) => {
                 if let Some(ds) = &mut self.daemon_status {
