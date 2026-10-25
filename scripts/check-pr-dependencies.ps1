@@ -18,6 +18,61 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+function Invoke-GhIssueViewWithRetry {
+    param(
+        [int]$IssueNumber,
+        [int]$MaxAttempts = 3,
+        [int]$InitialDelaySec = 1
+    )
+
+    $delay = $InitialDelaySec
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $raw = gh issue view $IssueNumber --json state,title 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            try {
+                return ($raw | ConvertFrom-Json)
+            } catch {
+                Write-Warning "Failed to parse gh output as JSON: $raw"
+            }
+        }
+
+        $errStr = "$raw"
+        $isRateLimitOrNetwork = ($errStr -match "403" -or $errStr -match "(?i)rate limit" -or $errStr -match "(?i)timed out" -or $errStr -match "(?i)connection")
+        if ($isRateLimitOrNetwork -and $attempt -lt $MaxAttempts) {
+            Write-Warning "Attempt $attempt/$MaxAttempts to query Issue #$IssueNumber encountered transient error/rate limit ($errStr). Retrying in ${delay}s..."
+            Start-Sleep -Seconds $delay
+            $delay = $delay * 2
+            continue
+        }
+
+        if ($attempt -eq $MaxAttempts) {
+            Write-Warning "Exhausted all $MaxAttempts attempts to query Issue #$IssueNumber via GitHub API ($errStr)."
+        }
+        break
+    }
+    return $null
+}
+
+function Test-GitAttestationResolved {
+    param(
+        [string]$Base,
+        [int]$IssueNumber
+    )
+
+    $gitLog = git log $Base -n 200 --pretty=format:"%B" 2>$null
+    if (-not $gitLog) {
+        $gitLog = git log -n 200 --pretty=format:"%B" 2>$null
+    }
+
+    if ($gitLog) {
+        $pattern = "(?i)(?:Resolves|Closes|Fixes|Closed):?\s*#$IssueNumber\b|Merge pull request #[0-9]+[\s\S]*(?:#$IssueNumber\b|issue\s+$IssueNumber\b)"
+        if ($gitLog -match $pattern) {
+            return $true
+        }
+    }
+    return $false
+}
+
 # Check environment override
 if ($env:NEBULA_SKIP_DEPENDENCY_NETWORK_CHECK -eq "1") {
     $SkipNetworkCheck = $true
@@ -86,30 +141,42 @@ if (-not $commits) {
 }
 
 # Known dependency DAG: Issue #71 (ruleset whitelist) is blocked by Issue #74 (red-team property tests)
-if ($commits -match "#71" -or $changedFiles -match "default.toml|rules.toml") {
+if ($commits -match "#71" -or $changedFiles -match "default\.toml|rules\.toml") {
     Write-Host "Verifying prerequisite dependency: Issue #74 (Security red-team tests for #71)..." -ForegroundColor Cyan
     
-    $issue74Raw = gh issue view 74 --json state,title 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "Could not connect to GitHub API ($issue74Raw). If working offline, re-run with -SkipNetworkCheck or set NEBULA_SKIP_DEPENDENCY_NETWORK_CHECK=1."
-        exit 1
+    $issue74Json = Invoke-GhIssueViewWithRetry -IssueNumber 74 -MaxAttempts 3 -InitialDelaySec 1
+    if ($null -ne $issue74Json) {
+        if ($issue74Json.state -ne "CLOSED") {
+            Write-Host ""
+            Write-Host "==========================================================================" -ForegroundColor Red
+            Write-Host "CI / PRE-PUSH GATE FAILURE: PR DEPENDENCY UNRESOLVED" -ForegroundColor Red
+            Write-Host "==========================================================================" -ForegroundColor Red
+            Write-Host "This PR modifies Protected Set permission rules (Issue #71)." -ForegroundColor Red
+            Write-Host "Prerequisite Issue #74 ($($issue74Json.title)) is still OPEN." -ForegroundColor Red
+            Write-Host "Protected Set Rule 9 requires security property tests (#74) to be merged" -ForegroundColor Red
+            Write-Host "into main BEFORE permission rules (#71) can be introduced." -ForegroundColor Red
+            Write-Host "==========================================================================" -ForegroundColor Red
+            exit 1
+        }
+        Write-Host "Prerequisite Issue #74 is CLOSED (merged) via GitHub API. Gate satisfied." -ForegroundColor Green
+    } else {
+        # Fallback to git-attestation
+        Write-Host "GitHub API unavailable or rate-limited. Falling back to git-attestation..." -ForegroundColor Yellow
+        $attested = Test-GitAttestationResolved -Base $BaseBranch -IssueNumber 74
+        if ($attested) {
+            Write-Host "GIT-ATTESTATION: Verified prerequisite Issue #74 is resolved in $BaseBranch via commit history. Gate satisfied." -ForegroundColor Green
+        } else {
+            Write-Host ""
+            Write-Host "==========================================================================" -ForegroundColor Red
+            Write-Host "CI / PRE-PUSH GATE FAILURE: GITHUB API RATE-LIMITED AND NO GIT ATTESTATION" -ForegroundColor Red
+            Write-Host "==========================================================================" -ForegroundColor Red
+            Write-Host "Could not verify Issue #74 status via GitHub API (rate limit or network error)" -ForegroundColor Red
+            Write-Host "AND no merge commit or commit trailer resolving Issue #74 was found in '$BaseBranch'." -ForegroundColor Red
+            Write-Host "If working offline, re-run with -SkipNetworkCheck or set NEBULA_SKIP_DEPENDENCY_NETWORK_CHECK=1." -ForegroundColor Red
+            Write-Host "==========================================================================" -ForegroundColor Red
+            exit 1
+        }
     }
-
-    $issue74Json = $issue74Raw | ConvertFrom-Json
-    if ($issue74Json.state -ne "CLOSED") {
-        Write-Host ""
-        Write-Host "==========================================================================" -ForegroundColor Red
-        Write-Host "CI / PRE-PUSH GATE FAILURE: PR DEPENDENCY UNRESOLVED" -ForegroundColor Red
-        Write-Host "==========================================================================" -ForegroundColor Red
-        Write-Host "This PR modifies Protected Set permission rules (Issue #71)." -ForegroundColor Red
-        Write-Host "Prerequisite Issue #74 ($($issue74Json.title)) is still OPEN." -ForegroundColor Red
-        Write-Host "Protected Set Rule 9 requires security property tests (#74) to be merged" -ForegroundColor Red
-        Write-Host "into main BEFORE permission rules (#71) can be introduced." -ForegroundColor Red
-        Write-Host "==========================================================================" -ForegroundColor Red
-        exit 1
-    }
-
-    Write-Host "Prerequisite Issue #74 is CLOSED (merged). Gate satisfied." -ForegroundColor Green
 }
 
 Write-Host "Protected Set & Dependency Check passed successfully." -ForegroundColor Green

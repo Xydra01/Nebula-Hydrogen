@@ -263,4 +263,77 @@ mod tests {
             }
         }
     }
+
+    // Issue #74: Property tests confirming toolchain whitelists reject path traversal and flag injection.
+    mod property_toolchain_confinement {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn traversal_path_strategy() -> impl Strategy<Value = String> {
+            prop_oneof![
+                Just("../../Cargo.toml".to_string()),
+                Just("../../../outside".to_string()),
+                Just("..\\..\\evil.exe".to_string()),
+                Just("C:\\evil".to_string()),
+                Just("C:\\Windows\\System32".to_string()),
+                Just("/etc/passwd".to_string()),
+                Just("\\Windows\\System32".to_string()),
+            ]
+        }
+
+        fn toolchain_command_strategy() -> impl Strategy<Value = (&'static str, &'static str)> {
+            prop_oneof![
+                Just(("cargo", "--manifest-path")),
+                Just(("cargo", "--target-dir")),
+                Just(("cmake", "-B")),
+                Just(("cmake", "-S")),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(100))]
+
+            #[test]
+            fn toolchain_escapes_always_escalate_above_sandbox(
+                (cmd, flag) in toolchain_command_strategy(),
+                path in traversal_path_strategy(),
+                use_equals in any::<bool>(),
+            ) {
+                let classifier = classifier();
+                let subcmd = if cmd == "cargo" { "test" } else { "--build" };
+                let (command, args) = if use_equals {
+                    (cmd.to_string(), vec![subcmd.to_string(), format!("{flag}={path}")])
+                } else {
+                    (cmd.to_string(), vec![subcmd.to_string(), flag.to_string(), path.clone()])
+                };
+
+                let (tier, approval) = classifier.classify(&command, &args);
+
+                // Any out-of-worktree path traversal or retired drive target MUST escalate
+                // to at least Tier::Workspace (Tier 2) or Tier::System (Tier 3), never Sandbox (Tier 1).
+                prop_assert!(
+                    tier > Tier::Sandbox,
+                    "Toolchain command {} with escape target {} classified at {:?}, expected > Sandbox",
+                    cmd,
+                    path,
+                    tier,
+                );
+
+                // If path is on retired drive C:, it MUST be Tier::System (Tier 3) and refuse approval
+                if path.starts_with("C:") || path.starts_with("c:") {
+                    prop_assert_eq!(
+                        tier,
+                        Tier::System,
+                        "Retired drive target {} must be Tier::System, got {:?}",
+                        path,
+                        tier,
+                    );
+                    prop_assert!(
+                        approval.is_none(),
+                        "Retired drive command must not have an approval",
+                    );
+                }
+            }
+        }
+    }
 }

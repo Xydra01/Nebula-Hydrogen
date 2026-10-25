@@ -40,9 +40,11 @@ use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE,
     JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP, JOB_OBJECT_LIMIT_JOB_MEMORY,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
-    JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION_0,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectCpuRateControlInformation,
-    JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION,
+    JOBOBJECT_CPU_RATE_CONTROL_INFORMATION_0, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicAccountingInformation, JobObjectCpuRateControlInformation,
+    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+    TerminateJobObject,
 };
 
 use windows::core::PCWSTR;
@@ -197,6 +199,32 @@ impl Job {
     pub fn terminate(&self, exit_code: u32) -> io::Result<()> {
         // SAFETY: `self.0` is a valid, live Job Object handle.
         unsafe { TerminateJobObject(self.0, exit_code) }.map_err(|e| win_err(&e))
+    }
+
+    /// Query the number of active processes currently associated with this job.
+    ///
+    /// # Errors
+    /// The underlying Win32 error if the query fails.
+    pub fn active_processes(&self) -> io::Result<u32> {
+        let mut info = std::mem::MaybeUninit::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>::zeroed();
+        let size = u32::try_from(std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>())
+            .map_err(io::Error::other)?;
+        let mut return_length = 0;
+        // SAFETY: `self.0` is a live job handle, `info` is a valid buffer of `size` bytes.
+        unsafe {
+            QueryInformationJobObject(
+                Some(self.0),
+                JobObjectBasicAccountingInformation,
+                info.as_mut_ptr().cast(),
+                size,
+                Some(&mut return_length),
+            )
+        }
+        .map_err(|e| win_err(&e))?;
+
+        // SAFETY: QueryInformationJobObject succeeded and initialized the struct.
+        let info = unsafe { info.assume_init() };
+        Ok(info.ActiveProcesses)
     }
 
     /// The raw job handle, for associating a completion port (see [`crate::job::CompletionPort`]).

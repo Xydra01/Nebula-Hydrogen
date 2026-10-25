@@ -237,6 +237,35 @@ fn tool_call_turn(id: &str, name: &str, arguments: &str) -> Vec<Value> {
     ]
 }
 
+fn multi_tool_call_turn(calls: &[(&str, &str, &str)]) -> Vec<Value> {
+    let tool_calls: Vec<Value> = calls
+        .iter()
+        .enumerate()
+        .map(|(i, (id, name, args))| {
+            json!({
+                "index": i,
+                "id": id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": args,
+                }
+            })
+        })
+        .collect();
+    vec![
+        json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": tool_calls
+                },
+                "finish_reason": null,
+            }]
+        }),
+        finish("tool_calls"),
+    ]
+}
+
 fn completion_turn(text: &str) -> Vec<Value> {
     vec![content(text), finish("stop")]
 }
@@ -1417,4 +1446,61 @@ async fn test_executor_verification_heuristic_nudges_and_completes() {
     assert_eq!(done.status, TaskStatus::Completed);
     assert!(done.summary.contains("Verification passed"));
     assert_eq!(steps.len(), 1);
+}
+
+#[tokio::test]
+async fn test_task_finish_enforces_process_barrier_before_commit() {
+    let h = start_harness().await;
+
+    // Multi-call turn: call_1 writes a file, call_2 calls task.finish
+    h.state.push_turn(multi_tool_call_turn(&[
+        (
+            "call_1",
+            "fs.write",
+            r#"{"path":"barrier_test.txt","content":"barrier verified"}"#,
+        ),
+        (
+            "call_2",
+            "task.finish",
+            r#"{"summary":"Delivered with process barrier","status":"success"}"#,
+        ),
+    ]));
+
+    let repo = seed_repo();
+    let mut c = h.ready_client().await;
+
+    let started: TaskStarted = c
+        .call(Method::TaskCreate(TaskCreateParams {
+            goal: "Verify process barrier on finish".into(),
+            repo: repo.path().to_path_buf(),
+            start_point: None,
+            profile: None,
+            max_tool_calls: Some(10),
+            max_tokens: None,
+            wall_time_secs: None,
+            create_pr: None,
+            language: None,
+            language_config: None,
+            verification_target: None,
+        }))
+        .await
+        .unwrap();
+
+    let (steps, done) = collect_task_events(&mut c, started.task_id).await;
+
+    assert_eq!(done.status, TaskStatus::Completed);
+    assert_eq!(done.summary, "Delivered with process barrier");
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].tool_calls, vec!["fs.write", "task.finish"]);
+
+    // Verify git branch contains the committed file
+    let branch = format!("nebula/{}", started.task_id);
+    let log_out = std::process::Command::new("git")
+        .args(["log", "-n", "1", "--format=%s", &branch])
+        .current_dir(repo.path())
+        .output()
+        .expect("git log");
+    assert!(log_out.status.success());
+    let commit_subject = String::from_utf8_lossy(&log_out.stdout);
+    assert!(commit_subject.contains("feat: Verify process barrier on finish"));
 }
