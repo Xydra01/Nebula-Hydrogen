@@ -257,35 +257,220 @@ EXIT DIRECTIVE: Once your verification and test commands pass with exit code 0 a
         },
     ];
 
-    let loop_future = execute_loop(
-        LoopContext {
-            shared: &shared,
-            task_id,
-            trace_id,
-            goal: &params.goal,
-            worktree_root: &worktree_root,
-            task_job: &task_job,
-            max_tool_calls,
-            max_tokens,
-            token: &token,
-            language_tools: &language_tools,
-            language_id: lang_module.as_ref().map(|m| m.id()),
-            verification_target: params.verification_target.as_deref(),
-        },
-        &mut messages,
-    );
+    let num_candidates = params
+        .language_config
+        .as_ref()
+        .and_then(|v| v.get("speculative_candidates"))
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .or_else(|| {
+            std::env::var("NEBULA_SPECULATIVE_CANDIDATES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(1)
+        .clamp(1, 4);
+    let (status, summary, active_worktree_root, active_wt_task_id) = if num_candidates > 1 {
+        tracing::info!(
+            event = "task.speculative_branching.started",
+            candidates = num_candidates,
+            task_id = %task_id
+        );
 
-    let (status, summary) =
-        match tokio::time::timeout(Duration::from_secs(wall_time_secs), loop_future).await {
-            Ok(result) => result,
-            Err(_) => {
-                tracing::warn!(event = "task.timeout", wall_time_secs = wall_time_secs);
-                (
-                    TaskStatus::LimitReached,
-                    format!("wall-clock timeout reached ({wall_time_secs}s)"),
-                )
+        let mut candidate_data = Vec::new();
+        for c in 0..num_candidates {
+            let cand_task_id = nebula_sandbox::worktree::TaskId::new(format!("{task_id}-cand-{c}"));
+            match shared
+                .worktrees
+                .create(&cand_task_id, &params.repo, params.start_point.as_deref())
+                .await
+            {
+                Ok(root) => {
+                    let cand_job = match TaskJob::new(format!("{task_id}-cand-{c}"), job_limits) {
+                        Ok(job) => Arc::new(job),
+                        Err(e) => {
+                            tracing::error!(event = "task.candidate_job_failed", candidate = c, error = %e);
+                            Arc::clone(&task_job)
+                        }
+                    };
+                    candidate_data.push((c, cand_task_id, root, cand_job));
+                }
+                Err(e) => {
+                    tracing::warn!(event = "task.candidate_worktree_failed", candidate = c, error = %e);
+                }
             }
-        };
+        }
+
+        if candidate_data.is_empty() {
+            let loop_future = execute_loop(
+                LoopContext {
+                    shared: &shared,
+                    task_id,
+                    trace_id,
+                    goal: &params.goal,
+                    worktree_root: &worktree_root,
+                    task_job: &task_job,
+                    max_tool_calls,
+                    max_tokens,
+                    token: &token,
+                    language_tools: &language_tools,
+                    language_id: lang_module.as_ref().map(|m| m.id()),
+                    verification_target: params.verification_target.as_deref(),
+                },
+                &mut messages,
+            );
+            let (st, sum) = match tokio::time::timeout(
+                Duration::from_secs(wall_time_secs),
+                loop_future,
+            )
+            .await
+            {
+                Ok(res) => res,
+                Err(_) => {
+                    tracing::warn!(event = "task.timeout", wall_time_secs = wall_time_secs);
+                    (
+                        TaskStatus::LimitReached,
+                        format!("wall-clock timeout reached ({wall_time_secs}s)"),
+                    )
+                }
+            };
+            (st, sum, worktree_root, wt_task_id)
+        } else {
+            let mut candidate_messages = Vec::new();
+            for (c, _, _, _) in &candidate_data {
+                let strategy_hint = match c {
+                    0 => "Candidate Strategy 0: Direct implementation and immediate verification.",
+                    1 => {
+                        "Candidate Strategy 1: Minimal surgical patch with targeted regression test."
+                    }
+                    2 => {
+                        "Candidate Strategy 2: Defensive refactoring and comprehensive verification."
+                    }
+                    _ => {
+                        "Candidate Strategy 3: Alternative algorithmic decomposition and validation."
+                    }
+                };
+                let mut c_messages = messages.clone();
+                c_messages.push(ChatMessage {
+                    role: Role::User,
+                    content: format!("[Candidate Strategy Guidance]: {strategy_hint}"),
+                });
+                candidate_messages.push(c_messages);
+            }
+
+            let mut futures = Vec::new();
+            for ((_, _, c_root, c_job), c_messages) in
+                candidate_data.iter().zip(candidate_messages.iter_mut())
+            {
+                let fut = execute_loop(
+                    LoopContext {
+                        shared: &shared,
+                        task_id,
+                        trace_id,
+                        goal: &params.goal,
+                        worktree_root: c_root,
+                        task_job: c_job,
+                        max_tool_calls,
+                        max_tokens,
+                        token: &token,
+                        language_tools: &language_tools,
+                        language_id: lang_module.as_ref().map(|m| m.id()),
+                        verification_target: params.verification_target.as_deref(),
+                    },
+                    c_messages,
+                );
+                futures.push(fut);
+            }
+
+            let join_fut = futures_util::future::join_all(futures);
+            let results =
+                match tokio::time::timeout(Duration::from_secs(wall_time_secs), join_fut).await {
+                    Ok(res) => res,
+                    Err(_) => {
+                        let mut timeout_results = Vec::new();
+                        for _ in 0..candidate_data.len() {
+                            timeout_results.push((
+                                TaskStatus::LimitReached,
+                                format!("wall-clock timeout reached ({wall_time_secs}s)"),
+                            ));
+                        }
+                        timeout_results
+                    }
+                };
+
+            let mut best_idx = 0;
+            for (idx, (st, _)) in results.iter().enumerate() {
+                if *st == TaskStatus::Completed {
+                    best_idx = idx;
+                    break;
+                }
+            }
+
+            let (best_status, best_summary) = results[best_idx].clone();
+            tracing::info!(
+                event = "task.speculative_branching.selected",
+                winning_candidate = best_idx,
+                status = ?best_status
+            );
+
+            let winning_root = candidate_data[best_idx].2.clone();
+            let winning_task_id = candidate_data[best_idx].1.clone();
+            let _ = commit_worktree_if_dirty(&winning_root, &params.goal, &task_id).await;
+
+            for (idx, (_, cand_id, cand_root, _)) in candidate_data.into_iter().enumerate() {
+                if idx != best_idx {
+                    let _ = commit_worktree_if_dirty(
+                        &cand_root,
+                        "speculative candidate discarded",
+                        &task_id,
+                    )
+                    .await;
+                    let _ = shared.worktrees.remove_worktree(&cand_id).await;
+                }
+            }
+
+            let _ = commit_worktree_if_dirty(
+                &worktree_root,
+                "primary worktree superseded by candidate",
+                &task_id,
+            )
+            .await;
+            let _ = shared.worktrees.remove_worktree(&wt_task_id).await;
+
+            (best_status, best_summary, winning_root, winning_task_id)
+        }
+    } else {
+        let loop_future = execute_loop(
+            LoopContext {
+                shared: &shared,
+                task_id,
+                trace_id,
+                goal: &params.goal,
+                worktree_root: &worktree_root,
+                task_job: &task_job,
+                max_tool_calls,
+                max_tokens,
+                token: &token,
+                language_tools: &language_tools,
+                language_id: lang_module.as_ref().map(|m| m.id()),
+                verification_target: params.verification_target.as_deref(),
+            },
+            &mut messages,
+        );
+
+        let (st, sum) =
+            match tokio::time::timeout(Duration::from_secs(wall_time_secs), loop_future).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!(event = "task.timeout", wall_time_secs = wall_time_secs);
+                    (
+                        TaskStatus::LimitReached,
+                        format!("wall-clock timeout reached ({wall_time_secs}s)"),
+                    )
+                }
+            };
+        (st, sum, worktree_root, wt_task_id)
+    };
 
     // 8. Cleanup and finalization
     drop(task_job);
@@ -295,7 +480,7 @@ EXIT DIRECTIVE: Once your verification and test commands pass with exit code 0 a
     {
         let prov_ctx = ProvisionContext {
             task_id: &task_id,
-            worktree_root: &worktree_root,
+            worktree_root: &active_worktree_root,
             task_job: None,
             language_config: params.language_config.as_ref(),
             trace_id: &trace_id,
@@ -317,10 +502,10 @@ EXIT DIRECTIVE: Once your verification and test commands pass with exit code 0 a
     }
 
     if status == TaskStatus::Completed || status == TaskStatus::LimitReached {
-        let _ = commit_worktree_if_dirty(&worktree_root, &params.goal, &task_id).await;
+        let _ = commit_worktree_if_dirty(&active_worktree_root, &params.goal, &task_id).await;
     }
 
-    let finalized_branch = shared.worktrees.finalize(&wt_task_id).await;
+    let finalized_branch = shared.worktrees.finalize(&active_wt_task_id).await;
 
     let should_create_pr = params.create_pr.unwrap_or(shared.config.github.enabled);
     let mut final_summary = summary;
@@ -329,7 +514,7 @@ EXIT DIRECTIVE: Once your verification and test commands pass with exit code 0 a
         && let Ok(branch_name) = finalized_branch
     {
         match crate::github::handle_task_completion(crate::github::TaskCompletionParams {
-            repo_root: &worktree_root,
+            repo_root: &active_worktree_root,
             branch: &branch_name,
             goal: &params.goal,
             summary: &final_summary,
@@ -478,7 +663,10 @@ async fn execute_loop(
             return (TaskStatus::Cancelled, "task cancelled by client".into());
         }
 
-        if let Err(e) = ctx.shared.game_mode.wait_if_active(ctx.token).await {
+        if ctx.shared.game_mode.is_active()
+            && ctx.shared.chat.status().state == nebula_proto::ModelState::Unloaded
+            && let Err(e) = ctx.shared.game_mode.wait_if_active(ctx.token).await
+        {
             return (TaskStatus::Cancelled, e);
         }
 
@@ -517,6 +705,11 @@ async fn execute_loop(
         let mut req = ChatRequest::new(messages.clone());
         req.tools = tools;
         req.max_tokens = DEFAULT_STEP_MAX_TOKENS.min(remaining_tokens);
+        if ctx.shared.game_mode.is_active() {
+            // WDDM continuous batching prefill clamping (Pivot 4 & 5 / Issue #35)
+            // Clamping step tokens to <= 32 keeps GPU quantum under 14.5ms, eliminating desktop/gaming frame drops
+            req.max_tokens = req.max_tokens.min(32);
+        }
         req.trace_id = Some(ctx.trace_id);
 
         let backend = match ctx.shared.chat.backend() {

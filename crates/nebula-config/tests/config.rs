@@ -267,7 +267,8 @@ fn game_mode_defaults_load_and_validate() {
     assert_eq!(cfg.game_mode.poll_interval_s, 2);
     assert_eq!(cfg.game_mode.vram_threshold_mib, 2048);
     assert_eq!(cfg.game_mode.cooldown_secs, 10);
-    assert!(cfg.game_mode.known_processes.contains(&"steam.exe".into()));
+    assert!(cfg.game_mode.known_processes.is_empty());
+    assert!(cfg.game_mode.desktop_allowlist.contains(&"dwm.exe".into()));
     assert!(
         cfg.game_mode
             .desktop_allowlist

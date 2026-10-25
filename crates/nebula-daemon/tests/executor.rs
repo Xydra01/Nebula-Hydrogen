@@ -1504,3 +1504,51 @@ async fn test_task_finish_enforces_process_barrier_before_commit() {
     let commit_subject = String::from_utf8_lossy(&log_out.stdout);
     assert!(commit_subject.contains("feat: Verify process barrier on finish"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_speculative_candidate_branching_promotes_winner() {
+    let h = start_harness().await;
+
+    h.state.set_chunks(multi_tool_call_turn(&[(
+        "call_1",
+        "task.finish",
+        r#"{"summary":"Candidate exploration complete","status":"success"}"#,
+    )]));
+
+    let repo = seed_repo();
+    let mut c = h.ready_client().await;
+
+    let started: TaskStarted = c
+        .call(Method::TaskCreate(TaskCreateParams {
+            goal: "Speculatively explore candidate solutions".into(),
+            repo: repo.path().to_path_buf(),
+            start_point: None,
+            profile: None,
+            max_tool_calls: Some(5),
+            max_tokens: None,
+            wall_time_secs: None,
+            create_pr: None,
+            language: None,
+            language_config: Some(json!({"speculative_candidates": 3})),
+            verification_target: None,
+        }))
+        .await
+        .unwrap();
+
+    let (_steps, done) = collect_task_events(&mut c, started.task_id).await;
+
+    assert_eq!(done.status, TaskStatus::Completed);
+    assert_eq!(done.summary, "Candidate exploration complete");
+
+    // Verify git branch for the winning candidate was finalized
+    let cand_branch = format!("nebula/{}-cand-0", started.task_id);
+    let log_out = std::process::Command::new("git")
+        .args(["log", "-n", "1", "--format=%s", &cand_branch])
+        .current_dir(repo.path())
+        .output()
+        .expect("git log on candidate branch");
+    assert!(
+        log_out.status.success(),
+        "winning candidate branch must exist"
+    );
+}

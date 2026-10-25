@@ -23,6 +23,7 @@ pub struct GameModeCoordinator {
     cooldown_deadline: Mutex<Option<Instant>>,
     events_tx: broadcast::Sender<GameModeChanged>,
     detector: Arc<dyn ForegroundDetector>,
+    languages: Mutex<Option<Arc<crate::language::LanguageRegistry>>>,
 }
 
 impl GameModeCoordinator {
@@ -42,7 +43,16 @@ impl GameModeCoordinator {
             cooldown_deadline: Mutex::new(None),
             events_tx,
             detector,
+            languages: Mutex::new(None),
         }
+    }
+
+    /// Attaches the language registry for coordinating pause/resume hooks (Issue #35).
+    pub fn set_language_registry(&self, registry: Arc<crate::language::LanguageRegistry>) {
+        *self
+            .languages
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(registry);
     }
 
     /// Subscribes to game mode change events.
@@ -117,8 +127,13 @@ impl GameModeCoordinator {
         Ok(self.status())
     }
 
-    /// Evaluates current system conditions (foreground window and GPU processes).
-    pub async fn check_and_update(&self, chat: &ModelManager, gpu_processes: &[GpuProcess]) {
+    /// Evaluates current system conditions (foreground window, GPU processes, and compute utilization).
+    pub async fn check_and_update(
+        &self,
+        chat: &ModelManager,
+        gpu_processes: &[GpuProcess],
+        gpu_util_pct: Option<u8>,
+    ) {
         if !self.config.enabled {
             return;
         }
@@ -139,7 +154,7 @@ impl GameModeCoordinator {
         }
 
         // 2. Evaluate auto-detection triggers.
-        let detected = self.detect_game_condition(gpu_processes);
+        let detected = self.detect_game_condition(gpu_processes, gpu_util_pct);
 
         if let Some((reason, proc_name)) = detected {
             // Reset cooldown because game is actively running
@@ -176,9 +191,14 @@ impl GameModeCoordinator {
         }
     }
 
-    fn detect_game_condition(&self, gpu_processes: &[GpuProcess]) -> Option<(String, String)> {
+    fn detect_game_condition(
+        &self,
+        gpu_processes: &[GpuProcess],
+        gpu_util_pct: Option<u8>,
+    ) -> Option<(String, String)> {
         // A. Fullscreen foreground window
-        if let Some(fg) = self.detector.detect()
+        let fg_opt = self.detector.detect();
+        if let Some(ref fg) = fg_opt
             && fg.is_fullscreen
         {
             let proc_name = get_process_name(fg.pid, gpu_processes);
@@ -210,13 +230,32 @@ impl GameModeCoordinator {
             }
         }
 
-        // C. High VRAM consumption by non-allowlisted process
+        // C. High VRAM consumption correlated with GPU compute utilization (> 15%) or foreground focus
         for gp in gpu_processes {
             if gp.vram_mib >= self.config.vram_threshold_mib && !self.is_allowlisted(&gp.name) {
-                return Some((
-                    format!("high VRAM usage ({} MiB by {})", gp.vram_mib, gp.name),
-                    gp.name.clone(),
-                ));
+                let is_foreground = fg_opt.as_ref().is_some_and(|fg| {
+                    if fg.pid == gp.pid {
+                        return true;
+                    }
+                    let fg_name = get_process_name(fg.pid, gpu_processes);
+                    !fg_name.is_empty() && fg_name.eq_ignore_ascii_case(&gp.name)
+                });
+                let is_compute_active = gpu_util_pct.unwrap_or(0) > 15;
+
+                if is_foreground || is_compute_active {
+                    let reason_detail = if is_foreground {
+                        "foreground focus"
+                    } else {
+                        "active compute"
+                    };
+                    return Some((
+                        format!(
+                            "high VRAM usage ({} MiB by {}, correlated with {})",
+                            gp.vram_mib, gp.name, reason_detail
+                        ),
+                        gp.name.clone(),
+                    ));
+                }
             }
         }
 
@@ -258,6 +297,16 @@ impl GameModeCoordinator {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = process;
 
+        // Notify registered language modules to pause MCP sessions (Issue #35, #73)
+        let langs = self
+            .languages
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(registry) = langs {
+            registry.on_pause().await;
+        }
+
         // Unload model to release VRAM before marking game mode active
         let _ = chat.unload().await;
 
@@ -292,6 +341,16 @@ impl GameModeCoordinator {
         // Reload the previous model profile if one was saved
         if let Some(profile) = saved {
             let _ = chat.set_profile(&profile).await;
+        }
+
+        // Notify registered language modules that inference has resumed (Issue #35, #73)
+        let langs = self
+            .languages
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(registry) = langs {
+            registry.on_resume().await;
         }
 
         let _ = self.active_tx.send(false);
@@ -406,7 +465,7 @@ mod tests {
         .unwrap();
 
         assert!(!coord.is_active());
-        coord.check_and_update(&chat, &fake_procs).await;
+        coord.check_and_update(&chat, &fake_procs, None).await;
         assert!(coord.is_active());
         assert_eq!(chat.status().state, ModelState::Unloaded);
 
@@ -447,13 +506,122 @@ mod tests {
         )
         .unwrap();
 
-        coord.check_and_update(&chat, &fake_procs).await;
+        coord.check_and_update(&chat, &fake_procs, None).await;
         assert!(!coord.is_active());
         assert_ne!(chat.status().state, ModelState::Unloaded);
     }
 
     #[tokio::test]
-    async fn test_game_mode_trips_on_high_vram() {
+    async fn test_game_mode_ignores_dwm_compositor_allocation() {
+        let mock_det = Arc::new(MockForegroundDetector::new());
+        mock_det.set(None);
+
+        let config = GameModeConfig {
+            enabled: true,
+            vram_threshold_mib: 2048,
+            cooldown_secs: 0,
+            ..Default::default()
+        };
+        let coord = GameModeCoordinator::new(config, mock_det);
+
+        let fake_procs = vec![GpuProcess {
+            pid: 100,
+            name: "dwm.exe".into(),
+            vram_mib: 3200, // 4K multi-monitor desktop composition buffer
+        }];
+
+        let launcher =
+            nebula_model::testing::FakeLauncher::new(nebula_model::testing::FakeState::new());
+        let blobs = test_telemetry().blobs().cloned();
+        let chat = ModelManager::spawn_with(
+            nebula_model::testing::config(),
+            test_supervisor(),
+            Arc::clone(&launcher) as _,
+            blobs,
+            None,
+        )
+        .unwrap();
+
+        coord.check_and_update(&chat, &fake_procs, Some(45)).await;
+        assert!(!coord.is_active());
+        assert_ne!(chat.status().state, ModelState::Unloaded);
+    }
+
+    #[tokio::test]
+    async fn test_game_mode_ignores_idle_tray_launcher() {
+        let mock_det = Arc::new(MockForegroundDetector::new());
+        mock_det.set(None);
+
+        let config = GameModeConfig {
+            enabled: true,
+            vram_threshold_mib: 2048,
+            cooldown_secs: 0,
+            ..Default::default()
+        };
+        let coord = GameModeCoordinator::new(config, mock_det);
+
+        let fake_procs = vec![GpuProcess {
+            pid: 500,
+            name: "steam.exe".into(),
+            vram_mib: 450,
+        }];
+
+        let launcher =
+            nebula_model::testing::FakeLauncher::new(nebula_model::testing::FakeState::new());
+        let blobs = test_telemetry().blobs().cloned();
+        let chat = ModelManager::spawn_with(
+            nebula_model::testing::config(),
+            test_supervisor(),
+            Arc::clone(&launcher) as _,
+            blobs,
+            None,
+        )
+        .unwrap();
+
+        coord.check_and_update(&chat, &fake_procs, Some(0)).await;
+        assert!(!coord.is_active());
+        assert_ne!(chat.status().state, ModelState::Unloaded);
+    }
+
+    #[tokio::test]
+    async fn test_game_mode_ignores_background_vram_without_compute_or_focus() {
+        let mock_det = Arc::new(MockForegroundDetector::new());
+        mock_det.set(None); // Not in foreground
+
+        let config = GameModeConfig {
+            enabled: true,
+            vram_threshold_mib: 2048,
+            cooldown_secs: 0,
+            ..Default::default()
+        };
+        let coord = GameModeCoordinator::new(config, mock_det);
+
+        let fake_procs = vec![GpuProcess {
+            pid: 9999,
+            name: "creative_app.exe".into(),
+            vram_mib: 3500,
+        }];
+
+        let launcher =
+            nebula_model::testing::FakeLauncher::new(nebula_model::testing::FakeState::new());
+        let blobs = test_telemetry().blobs().cloned();
+        let chat = ModelManager::spawn_with(
+            nebula_model::testing::config(),
+            test_supervisor(),
+            Arc::clone(&launcher) as _,
+            blobs,
+            None,
+        )
+        .unwrap();
+
+        // 5% GPU compute utilization (<= 15%) in background does NOT trip game mode
+        coord.check_and_update(&chat, &fake_procs, Some(5)).await;
+        assert!(!coord.is_active());
+        assert_ne!(chat.status().state, ModelState::Unloaded);
+    }
+
+    #[tokio::test]
+    async fn test_game_mode_trips_on_high_vram_correlated_with_compute() {
         let mock_det = Arc::new(MockForegroundDetector::new());
         mock_det.set(None);
 
@@ -483,7 +651,8 @@ mod tests {
         )
         .unwrap();
 
-        coord.check_and_update(&chat, &fake_procs).await;
+        // 35% GPU compute utilization (> 15%) trips game mode
+        coord.check_and_update(&chat, &fake_procs, Some(35)).await;
         assert!(coord.is_active());
         assert_eq!(chat.status().state, ModelState::Unloaded);
     }
