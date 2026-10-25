@@ -9,6 +9,7 @@
 | [ADR-005](ADR-005-fallback-model.md) | Fallback model | Accepted (2026-10-02) |
 | [ADR-006](ADR-006-mtp-speculative-decoding.md) | MTP speculative decoding for the `standard` profile | Accepted (2026-10-04) |
 | [ADR-007](ADR-007-ipc-framing.md) | IPC framing: NDJSON JSON-RPC over a named pipe | Accepted (2026-10-04) |
+| [ADR-008](ADR-008-cpp-language-module-and-devtools-boundary.md) | C++ language module and devtools boundary | Accepted (2026-10-24) |
 
 These first three were extracted from [NEBULA_DESIGN.md](../NEBULA_DESIGN.md) Section 3. From now on, the ADR files are the source of truth for decisions, and the design doc links to them.
 

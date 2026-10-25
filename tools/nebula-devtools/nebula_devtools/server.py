@@ -12,6 +12,7 @@ import json
 import os
 
 from .adapters import errored_result
+from .adapters.cpp_adapter import CppAdapter
 from .adapters.python_adapter import PythonAdapter
 from .adapters.rust_adapter import RustAdapter
 from .detect import (
@@ -26,6 +27,7 @@ from .model import StructuredResult
 from .run import RunOutput
 
 _ADAPTERS = {
+    "cpp": CppAdapter(),
     "python": PythonAdapter(),
     "rust": RustAdapter(),
 }
@@ -37,7 +39,7 @@ _INPUT_SCHEMA = {
     "properties": {
         "language": {
             "type": "string",
-            "enum": ["python", "rust"],
+            "enum": ["cpp", "python", "rust"],
             "description": "Target language; if omitted, detected from the worktree.",
         },
         "cwd": {

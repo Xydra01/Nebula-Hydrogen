@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 
 #: The languages this server supports in v1.
-SUPPORTED = ("python", "rust")
+SUPPORTED = ("python", "rust", "cpp")
 
 
 class ConfinementError(Exception):
@@ -24,16 +24,18 @@ class LanguageError(Exception):
 
 def detect_language(cwd: str) -> str | None:
     """Detect the worktree's language from its manifest files.
-
-    ``Cargo.toml`` -> ``"rust"``; ``pyproject.toml`` -> ``"python"``. Rust is checked first so a
-    polyglot repo with both manifests resolves to Rust (the workspace's primary language); callers
-    that need the other language pass it explicitly. Returns ``None`` when neither is present.
+    ``Cargo.toml`` -> ``"rust"``; ``pyproject.toml`` -> ``"python"``;
+    ``CMakeLists.txt`` / ``compile_commands.json`` -> ``"cpp"``.
+    Rust is checked first so a polyglot repo with multiple manifests resolves consistently; callers
+    that need another language pass it explicitly. Returns ``None`` when none is present.
     """
     root = Path(cwd)
     if (root / "Cargo.toml").is_file():
         return "rust"
     if (root / "pyproject.toml").is_file():
         return "python"
+    if (root / "CMakeLists.txt").is_file() or (root / "compile_commands.json").is_file():
+        return "cpp"
     return None
 
 
