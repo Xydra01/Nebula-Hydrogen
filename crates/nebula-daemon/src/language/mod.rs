@@ -16,8 +16,15 @@ use nebula_tools::BuiltinTool;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod cpp;
 pub mod polyglot;
+pub mod python;
+pub mod sql;
+
+pub use cpp::CppModule;
 pub use polyglot::PolyglotModule;
+pub use python::PythonModule;
+pub use sql::SqlModule;
 
 /// The environment and configuration context passed during module provisioning.
 pub struct ProvisionContext<'a> {
@@ -115,11 +122,14 @@ impl LanguageRegistry {
         }
     }
 
-    /// Create a language registry initialized with default modules (`PolyglotModule`).
+    /// Create a language registry initialized with default modules (`PolyglotModule`, `PythonModule`, `CppModule`, `SqlModule`).
     #[must_use]
     pub fn with_defaults() -> Self {
         let registry = Self::new();
         registry.register(Arc::new(PolyglotModule));
+        registry.register(Arc::new(PythonModule));
+        registry.register(Arc::new(CppModule));
+        registry.register(Arc::new(SqlModule));
         registry
     }
 
@@ -257,33 +267,52 @@ mod tests {
 
     #[tokio::test]
     async fn registry_registers_and_retrieves_module() {
-        let registry = LanguageRegistry::with_defaults();
-        assert!(registry.get("polyglot").is_some());
+        let registry = LanguageRegistry::new();
+        assert!(registry.get("polyglot").is_none());
         assert!(registry.get("python").is_none());
 
+        registry.register(Arc::new(PolyglotModule));
         registry.register(Arc::new(MockPythonModule));
+        assert!(registry.get("polyglot").is_some());
         assert!(registry.get("python").is_some());
 
         let list = registry.list();
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].id, "polyglot");
         assert_eq!(list[1].id, "python");
+
+        let defaults = LanguageRegistry::with_defaults();
+        assert!(defaults.get("polyglot").is_some());
+        assert!(defaults.get("python").is_some());
+        assert!(defaults.get("cpp").is_some());
+        assert!(defaults.get("sql").is_some());
     }
 
     #[tokio::test]
     async fn registry_detects_highest_scoring_module() {
         let registry = LanguageRegistry::with_defaults();
-        registry.register(Arc::new(MockPythonModule));
 
         let tmp = tempfile::tempdir().unwrap();
-        // Without pyproject.toml, falls back to polyglot (0.1)
+        // Without specific manifest, falls back to polyglot (0.1)
         let detected = registry.detect(tmp.path()).await.unwrap();
         assert_eq!(detected.id(), "polyglot");
 
-        // With pyproject.toml, python module scores 0.9 > 0.1
+        // With pyproject.toml, python module scores 0.95 > 0.1
         std::fs::write(tmp.path().join("pyproject.toml"), "").unwrap();
         let detected = registry.detect(tmp.path()).await.unwrap();
         assert_eq!(detected.id(), "python");
+
+        // With CMakeLists.txt, cpp module scores 0.95
+        let tmp_cpp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp_cpp.path().join("CMakeLists.txt"), "").unwrap();
+        let detected = registry.detect(tmp_cpp.path()).await.unwrap();
+        assert_eq!(detected.id(), "cpp");
+
+        // With schema.sql, sql module scores 0.95
+        let tmp_sql = tempfile::tempdir().unwrap();
+        std::fs::write(tmp_sql.path().join("schema.sql"), "").unwrap();
+        let detected = registry.detect(tmp_sql.path()).await.unwrap();
+        assert_eq!(detected.id(), "sql");
     }
 
     #[tokio::test]

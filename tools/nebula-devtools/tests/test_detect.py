@@ -29,6 +29,18 @@ def test_rust_wins_when_both_present(tmp_path):
     assert detect_language(str(tmp_path)) == "rust"
 
 
+def test_detects_cpp_from_cmakelists(tmp_path):
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.20)\n", encoding="utf-8"
+    )
+    assert detect_language(str(tmp_path)) == "cpp"
+
+
+def test_detects_cpp_from_compile_commands(tmp_path):
+    (tmp_path / "compile_commands.json").write_text("[]\n", encoding="utf-8")
+    assert detect_language(str(tmp_path)) == "cpp"
+
+
 def test_no_manifest_detects_none(tmp_path):
     assert detect_language(str(tmp_path)) is None
 
