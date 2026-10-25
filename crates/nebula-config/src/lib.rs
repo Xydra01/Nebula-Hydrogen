@@ -431,6 +431,8 @@ fn default_game_mode_desktop_allowlist() -> Vec<String> {
         "powershell.exe".into(),
         "cmd.exe".into(),
         "taskmgr.exe".into(),
+        "llama-server.exe".into(),
+        "hydrogen_engine.exe".into(),
     ]
 }
 

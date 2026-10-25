@@ -171,7 +171,13 @@ impl LanguageRegistry {
     #[must_use]
     pub fn get(&self, id: &str) -> Option<Arc<dyn LanguageModule>> {
         let lock = self.modules.read().unwrap_or_else(PoisonError::into_inner);
-        lock.get(id).cloned()
+        lock.get(id).cloned().or_else(|| {
+            if id.eq_ignore_ascii_case("rust") {
+                lock.get("polyglot").cloned()
+            } else {
+                None
+            }
+        })
     }
 
     /// Return metadata for all registered language modules, sorted by ID.

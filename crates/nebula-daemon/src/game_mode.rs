@@ -266,6 +266,8 @@ impl GameModeCoordinator {
         // Nebula's own processes are never games
         if name.eq_ignore_ascii_case("llama-server.exe")
             || name.eq_ignore_ascii_case("llama-server")
+            || name.eq_ignore_ascii_case("hydrogen_engine.exe")
+            || name.eq_ignore_ascii_case("hydrogen_engine")
             || name.eq_ignore_ascii_case("nebula-daemon.exe")
             || name.eq_ignore_ascii_case("nebula-daemon")
             || name.eq_ignore_ascii_case("nebula.exe")

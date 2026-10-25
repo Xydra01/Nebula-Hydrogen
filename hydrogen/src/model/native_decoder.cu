@@ -2176,6 +2176,7 @@ void NativeDecoder::generate(
     bool reset_state,
     const uint32_t* d_grammar_bitmask
 ) {
+    server.poll_and_reply_pings();
     generate(
         prompt,
         max_tokens,
@@ -2203,6 +2204,7 @@ void NativeDecoder::generate(
     const uint32_t* stop_tokens,
     uint32_t stop_token_count
 ) {
+    server.poll_and_reply_pings();
     generate(
         prompt_tokens,
         max_tokens,

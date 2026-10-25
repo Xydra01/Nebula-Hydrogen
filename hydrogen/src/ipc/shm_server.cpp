@@ -383,6 +383,8 @@ bool ShmServer::send_token(uint32_t stream_id,
                            float logit,
                            const std::string& token_text,
                            bool is_final) {
+    poll_and_reply_pings();
+
     TokenPayload payload;
     std::memset(&payload, 0, sizeof(payload));
     payload.token_id = token_id;
@@ -397,6 +399,18 @@ bool ShmServer::send_token(uint32_t stream_id,
 
     const uint16_t flags = is_final ? FrameFlags::END_OF_STREAM : FrameFlags::NONE;
     return send_response(MessageType::MSG_TOKEN_CHUNK, stream_id, flags, &payload, sizeof(payload));
+}
+
+void ShmServer::poll_and_reply_pings() {
+    if (!is_initialized_) return;
+    IpcFrameHeader req_hdr;
+    uint8_t dummy_payload[64];
+    while (poll_request(req_hdr, dummy_payload, sizeof(dummy_payload))) {
+        if (req_hdr.msg_type == static_cast<uint16_t>(MessageType::MSG_PING)) {
+            send_response(MessageType::MSG_PONG, req_hdr.stream_id, FrameFlags::NONE,
+                          nullptr, 0, req_hdr.sequence_num);
+        }
+    }
 }
 
 bool ShmServer::send_tool_call(uint32_t stream_id,

@@ -125,6 +125,9 @@ public:
                       size_t max_payload_len,
                       uint32_t timeout_ms = 1000);
 
+    /// Checks for and immediately services any pending MSG_PING frames during generation.
+    void poll_and_reply_pings();
+
     // Stream-Lease Registry Operations (0..7)
     int32_t acquire_stream_slot() noexcept;
     void release_stream_slot(uint32_t slot) noexcept;
