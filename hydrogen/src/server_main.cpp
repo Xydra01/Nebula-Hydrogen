@@ -375,7 +375,7 @@ int main(int argc, char* argv[]) {
             sampling.temperature = extract_float_from_json(req_json, "temperature", 0.7f);
             sampling.top_p = extract_float_from_json(req_json, "top_p", 0.80f);
             sampling.min_p = extract_float_from_json(req_json, "min_p", 0.0f);
-            sampling.repetition_penalty = extract_float_from_json(req_json, "repeat_penalty", 1.05f);
+            sampling.repetition_penalty = extract_float_from_json(req_json, "repeat_penalty", 1.15f);
 
             bool is_tool_continuation = (prompt.find("<|im_start|>tool") != std::string::npos ||
                                          req_json.find("\"role\":\"tool\"") != std::string::npos ||

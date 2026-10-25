@@ -325,6 +325,7 @@ EXIT DIRECTIVE: Once your verification and test commands pass with exit code 0 a
                     language_tools: &language_tools,
                     language_id: lang_module.as_ref().map(|m| m.id()),
                     verification_target: params.verification_target.as_deref(),
+                    candidates: 1,
                 },
                 &mut messages,
             );
@@ -385,6 +386,7 @@ EXIT DIRECTIVE: Once your verification and test commands pass with exit code 0 a
                         language_tools: &language_tools,
                         language_id: lang_module.as_ref().map(|m| m.id()),
                         verification_target: params.verification_target.as_deref(),
+                        candidates: u32::try_from(num_candidates).unwrap_or(1),
                     },
                     c_messages,
                 );
@@ -463,6 +465,7 @@ EXIT DIRECTIVE: Once your verification and test commands pass with exit code 0 a
                 language_tools: &language_tools,
                 language_id: lang_module.as_ref().map(|m| m.id()),
                 verification_target: params.verification_target.as_deref(),
+                candidates: 1,
             },
             &mut messages,
         );
@@ -591,6 +594,7 @@ struct LoopContext<'a> {
     language_tools: &'a [Arc<dyn nebula_tools::BuiltinTool>],
     language_id: Option<&'a str>,
     verification_target: Option<&'a str>,
+    candidates: u32,
 }
 
 fn normalize_mount_path(p: &Path) -> String {
@@ -770,6 +774,7 @@ async fn execute_loop(
                             text.clone()
                         },
                         reasoning: if reasoning { text } else { String::new() },
+                        streams: Some(ctx.candidates),
                     });
                     ctx.shared.emit_event(token_ev);
                 }
@@ -943,6 +948,7 @@ async fn execute_loop(
             step_id,
             step_index,
             tool_calls: tool_names.clone(),
+            streams: Some(ctx.candidates),
         });
         ctx.shared.emit_event(step_ev);
 
@@ -1265,6 +1271,7 @@ async fn execute_loop(
                 chat_id,
                 text: outcome_summary,
                 reasoning: String::new(),
+                streams: Some(ctx.candidates),
             }));
 
             let tool_output = format!("[tool result: {}]\n{}", call.name, result_content);

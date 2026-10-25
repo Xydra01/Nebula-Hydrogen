@@ -72,6 +72,9 @@ pub struct ChatToken {
     /// Reasoning text.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reasoning: String,
+    /// Optional number of concurrent streams assigned to the generating task/chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streams: Option<u32>,
 }
 
 /// End of a chat.
@@ -140,6 +143,9 @@ pub struct TaskStep {
     /// Names of tools called during this step, if any.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<String>,
+    /// Optional number of concurrent streams assigned to this task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streams: Option<u32>,
 }
 
 /// End of an executor task.

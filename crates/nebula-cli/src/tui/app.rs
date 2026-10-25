@@ -440,6 +440,9 @@ impl TuiApp {
                 let task_id = TaskId::from_ulid(t.chat_id.ulid());
                 if let Some(task) = self.tasks.iter_mut().find(|task| task.id == task_id) {
                     task.live_tokens += 1;
+                    if let Some(s) = t.streams {
+                        task.streams = s as usize;
+                    }
                     if !t.text.is_empty() {
                         let snippet = t.text.trim();
                         if !snippet.is_empty() {
@@ -477,7 +480,7 @@ impl TuiApp {
                         step_count: 0,
                         language: self.active_language.clone(),
                         mcp_healthy: true,
-                        streams: 1,
+                        streams: t.streams.unwrap_or(1) as usize,
                         live_tokens: 1,
                         live_preview: preview,
                     });
@@ -506,6 +509,9 @@ impl TuiApp {
                 if let Some(task) = self.tasks.iter_mut().find(|t| t.id == step.task_id) {
                     task.step_count = step.step_index as usize;
                     task.live_preview = None;
+                    if let Some(s) = step.streams {
+                        task.streams = s as usize;
+                    }
                 } else {
                     self.tasks.push(TaskItem {
                         id: step.task_id,
@@ -514,7 +520,7 @@ impl TuiApp {
                         step_count: step.step_index as usize,
                         language: self.active_language.clone(),
                         mcp_healthy: true,
-                        streams: 1,
+                        streams: step.streams.unwrap_or(1) as usize,
                         live_tokens: 0,
                         live_preview: None,
                     });

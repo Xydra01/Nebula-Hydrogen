@@ -455,6 +455,7 @@ fn snapshot_task_formatting() {
         step_id,
         step_index: 1,
         tool_calls: vec!["fs.read".into(), "shell.execute".into()],
+        streams: None,
     };
     let done = TaskDone {
         task_id,

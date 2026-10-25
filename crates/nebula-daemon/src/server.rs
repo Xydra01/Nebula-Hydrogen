@@ -784,6 +784,7 @@ async fn run_chat(
                     chat_id,
                     text,
                     reasoning,
+                    streams: None,
                 }))
             }
             Some(Ok(StreamItem::ToolCall(_))) => continue,

@@ -2214,6 +2214,12 @@ void NativeDecoder::generate(
                         return;
                     }
                 }
+                ToolCall tc = parse_tool_call_json(accumulated_text, stream_id);
+                if (!tc.name.empty()) {
+                    on_tool_call(tc);
+                    stream_seq_pos_[stream_slot] = seq_pos;
+                    return;
+                }
             }
             if (on_token) on_token(next_token, logit, "", true);
             stream_seq_pos_[stream_slot] = seq_pos;
@@ -2230,16 +2236,55 @@ void NativeDecoder::generate(
         }
 
         // Check for completed tool call before EOS
-        if (on_tool_call && accumulated_text.find("</tool_call>") != std::string::npos) {
-            size_t start_tag = accumulated_text.find("<tool_call>");
-            size_t end_tag = accumulated_text.find("</tool_call>");
-            if (start_tag != std::string::npos && end_tag > start_tag) {
-                std::string json_body = accumulated_text.substr(start_tag + 11, end_tag - (start_tag + 11));
-                ToolCall tc = parse_tool_call_json(json_body, stream_id);
-                if (!tc.name.empty()) {
-                    on_tool_call(tc);
-                    stream_seq_pos_[stream_slot] = seq_pos;
-                    return;
+        if (on_tool_call) {
+            // 1. Tagged format: <tool_call> ... </tool_call>
+            if (accumulated_text.find("</tool_call>") != std::string::npos) {
+                size_t start_tag = accumulated_text.find("<tool_call>");
+                size_t end_tag = accumulated_text.find("</tool_call>");
+                if (start_tag != std::string::npos && end_tag > start_tag) {
+                    std::string json_body = accumulated_text.substr(start_tag + 11, end_tag - (start_tag + 11));
+                    ToolCall tc = parse_tool_call_json(json_body, stream_id);
+                    if (!tc.name.empty()) {
+                        on_tool_call(tc);
+                        stream_seq_pos_[stream_slot] = seq_pos;
+                        return;
+                    }
+                }
+            }
+
+            // 2. Untagged/Raw JSON format: {"name": "...", "arguments": {...}}
+            if (token_str.find('}') != std::string::npos) {
+                size_t name_pos = accumulated_text.find("\"name\"");
+                if (name_pos != std::string::npos) {
+                    size_t start_obj = accumulated_text.rfind('{', name_pos);
+                    if (start_obj != std::string::npos) {
+                        int depth = 0;
+                        bool in_str = false;
+                        bool esc = false;
+                        for (size_t k = start_obj; k < accumulated_text.size(); ++k) {
+                            char c = accumulated_text[k];
+                            if (in_str) {
+                                if (esc) esc = false;
+                                else if (c == '\\') esc = true;
+                                else if (c == '"') in_str = false;
+                            } else {
+                                if (c == '"') in_str = true;
+                                else if (c == '{') depth++;
+                                else if (c == '}') {
+                                    depth--;
+                                    if (depth == 0) {
+                                        std::string raw_obj = accumulated_text.substr(start_obj, k - start_obj + 1);
+                                        ToolCall tc = parse_tool_call_json(raw_obj, stream_id);
+                                        if (!tc.name.empty()) {
+                                            on_tool_call(tc);
+                                            stream_seq_pos_[stream_slot] = seq_pos;
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

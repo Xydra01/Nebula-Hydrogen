@@ -500,7 +500,7 @@ fn events() {
     let cases: Vec<(&str, Event)> = vec![
         (
             "evt_chat_token",
-            Event::ChatToken(ChatToken { chat_id: chat_id(), text: "39".into(), reasoning: String::new() }),
+            Event::ChatToken(ChatToken { chat_id: chat_id(), text: "39".into(), reasoning: String::new(), streams: None }),
         ),
         (
             "evt_chat_token_reasoning",
@@ -508,6 +508,7 @@ fn events() {
                 chat_id: chat_id(),
                 text: String::new(),
                 reasoning: "17 * 23 = 391".into(),
+                streams: None,
             }),
         ),
         (
@@ -565,6 +566,7 @@ fn events() {
                 step_id: step_id(),
                 step_index: 0,
                 tool_calls: vec!["test.run".into()],
+                streams: None,
             }),
         ),
         (
