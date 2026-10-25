@@ -128,6 +128,7 @@ fn parses_every_command() {
                 language,
                 python_version: _,
                 verification_target,
+                streams: _,
             }),
     } = parse(&[
         "task",

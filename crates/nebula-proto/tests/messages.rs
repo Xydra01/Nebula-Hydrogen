@@ -185,6 +185,7 @@ fn requests() {
                     language: None,
                     language_config: None,
                     verification_target: None,
+                    streams: None,
                 }),
             ),
         ),

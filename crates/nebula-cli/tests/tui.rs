@@ -95,6 +95,9 @@ fn test_tui_populated_dashboard_layout() {
         step_count: 3,
         language: Some("rust".into()),
         mcp_healthy: true,
+        streams: 1,
+        live_tokens: 0,
+        live_preview: None,
     });
 
     app.streaming_text = "Analyzing schema definitions in crates/nebula-db/src/migrations.rs...\nFound 4 migrations requiring transactional boundaries.".into();

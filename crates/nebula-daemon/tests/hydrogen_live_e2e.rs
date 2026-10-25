@@ -608,6 +608,7 @@ async fn test_hydrogen_live_e2e_complete_pipeline() {
             language: None,
             language_config: None,
             verification_target: None,
+            streams: None,
         }))
         .await
         .expect("task create");

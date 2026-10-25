@@ -262,11 +262,16 @@ EXIT DIRECTIVE: Once your verification and test commands pass with exit code 0 a
     ];
 
     let num_candidates = params
-        .language_config
-        .as_ref()
-        .and_then(|v| v.get("speculative_candidates"))
-        .and_then(Value::as_u64)
-        .and_then(|n| usize::try_from(n).ok())
+        .streams
+        .map(|s| s as usize)
+        .or_else(|| {
+            params
+                .language_config
+                .as_ref()
+                .and_then(|v| v.get("speculative_candidates"))
+                .and_then(Value::as_u64)
+                .and_then(|n| usize::try_from(n).ok())
+        })
         .or_else(|| {
             std::env::var("NEBULA_SPECULATIVE_CANDIDATES")
                 .ok()

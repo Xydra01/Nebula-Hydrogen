@@ -312,6 +312,7 @@ async fn test_executor_completes_without_tools() {
             language: None,
             language_config: None,
             verification_target: None,
+            streams: None,
         }))
         .await
         .unwrap();
@@ -349,6 +350,7 @@ async fn test_executor_tool_call_limit_reached() {
             language: None,
             language_config: None,
             verification_target: None,
+            streams: None,
         }))
         .await
         .unwrap();
@@ -406,6 +408,7 @@ async fn test_executor_token_budget_exhausted() {
             language: None,
             language_config: None,
             verification_target: None,
+            streams: None,
         }))
         .await
         .unwrap();
@@ -443,6 +446,7 @@ async fn test_executor_wall_clock_timeout() {
             language: None,
             language_config: None,
             verification_target: None,
+            streams: None,
         }))
         .await
         .unwrap();
@@ -477,6 +481,7 @@ async fn test_executor_cancellation() {
             language: None,
             language_config: None,
             verification_target: None,
+            streams: None,
         }))
         .await
         .unwrap();
@@ -552,6 +557,7 @@ async fn test_phase1_exit_criterion_fixes_failing_test() {
             language: None,
             language_config: None,
             verification_target: None,
+            streams: None,
         }))
         .await
         .unwrap();
@@ -626,6 +632,7 @@ async fn test_executor_voluntary_exit_directive_prevents_ceiling() {
             language: None,
             language_config: None,
             verification_target: None,
+            streams: None,
         }))
         .await
         .unwrap();
@@ -672,6 +679,7 @@ async fn test_real_model_fixes_failing_test() {
             language: None,
             language_config: None,
             verification_target: None,
+            streams: None,
         }))
         .await
         .unwrap();
@@ -706,6 +714,7 @@ async fn test_circuit_breaker_repeated_tool_failure() {
             language: None,
             language_config: None,
             verification_target: None,
+            streams: None,
         }))
         .await
         .unwrap();
@@ -751,6 +760,7 @@ async fn test_circuit_breaker_repeated_file_edits() {
             language: None,
             language_config: None,
             verification_target: None,
+            streams: None,
         }))
         .await
         .unwrap();
@@ -812,6 +822,7 @@ async fn test_circuit_breaker_runaway_tokens() {
             language: None,
             language_config: None,
             verification_target: None,
+            streams: None,
         }))
         .await
         .unwrap();
@@ -857,6 +868,7 @@ async fn test_global_stop_terminates_all_tasks_within_two_seconds() {
             language: None,
             language_config: None,
             verification_target: None,
+            streams: None,
         }))
         .await
         .unwrap();
@@ -1023,6 +1035,7 @@ async fn test_disk_guard_trips_with_fake_low_space() {
             language: None,
             language_config: None,
             verification_target: None,
+            streams: None,
         }))
         .await
         .unwrap();
@@ -1070,6 +1083,7 @@ async fn test_refuse_writes_to_retired_drive() {
             language: None,
             language_config: None,
             verification_target: None,
+            streams: None,
         }))
         .await
         .unwrap();
@@ -1102,6 +1116,7 @@ async fn test_executor_events_broadcast_to_observer_client() {
             language: None,
             language_config: None,
             verification_target: None,
+            streams: None,
         }))
         .await
         .unwrap();
@@ -1159,6 +1174,7 @@ async fn test_executor_approval_pause_and_resume() {
             language: None,
             language_config: None,
             verification_target: None,
+            streams: None,
         }))
         .await
         .unwrap();
@@ -1231,6 +1247,7 @@ async fn test_executor_completion_summary_with_conversational_phrase() {
             language: None,
             language_config: None,
             verification_target: None,
+            streams: None,
         }))
         .await
         .unwrap();
@@ -1270,6 +1287,7 @@ async fn test_executor_nudge_exhaustion_completes_if_tools_executed() {
             language: None,
             language_config: None,
             verification_target: None,
+            streams: None,
         }))
         .await
         .unwrap();
@@ -1378,6 +1396,7 @@ async fn test_task_finish_triggers_auto_commit_and_halts_immediately() {
             language: None,
             language_config: None,
             verification_target: None,
+            streams: None,
         }))
         .await
         .unwrap();
@@ -1437,6 +1456,7 @@ async fn test_executor_verification_heuristic_nudges_and_completes() {
             language: None,
             language_config: None,
             verification_target: Some("fs.read".into()),
+            streams: None,
         }))
         .await
         .unwrap();
@@ -1482,6 +1502,7 @@ async fn test_task_finish_enforces_process_barrier_before_commit() {
             language: None,
             language_config: None,
             verification_target: None,
+            streams: None,
         }))
         .await
         .unwrap();
@@ -1531,6 +1552,7 @@ async fn test_speculative_candidate_branching_promotes_winner() {
             language: None,
             language_config: Some(json!({"speculative_candidates": 3})),
             verification_target: None,
+            streams: None,
         }))
         .await
         .unwrap();

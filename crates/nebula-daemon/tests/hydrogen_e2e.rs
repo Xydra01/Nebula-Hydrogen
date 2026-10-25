@@ -487,6 +487,7 @@ async fn test_hydrogen_e2e_multiturn_tool_pipeline() {
             language: None,
             language_config: None,
             verification_target: None,
+            streams: None,
         }))
         .await
         .expect("task create");
