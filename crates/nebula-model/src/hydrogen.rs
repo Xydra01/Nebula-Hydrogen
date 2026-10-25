@@ -382,22 +382,42 @@ impl ModelBackend for HydrogenBackend {
             })?;
         }
 
-        let _guard = self.activity.enter();
+        let (out_tx, out_rx) = mpsc::channel(1024);
+        let guard = self.activity.enter();
         let router_table = Arc::clone(&self.router_table);
         let cancel = self.activity.cancel_token();
         tokio::spawn(async move {
-            let _g = _guard;
-            cancel.cancelled().await;
-            let sender = {
-                let mut table = router_table.lock().unwrap_or_else(PoisonError::into_inner);
-                table.remove(&stream_id)
-            };
-            if let Some(tx) = sender {
-                let _ = tx.send(Ok(StreamItem::Done(StopReason::Cancelled))).await;
+            let _guard = guard;
+            let mut rx = rx;
+            loop {
+                tokio::select! {
+                    () = cancel.cancelled() => {
+                        let sender = {
+                            let mut table = router_table.lock().unwrap_or_else(PoisonError::into_inner);
+                            table.remove(&stream_id)
+                        };
+                        if let Some(tx) = sender {
+                            let _ = tx.send(Ok(StreamItem::Done(StopReason::Cancelled))).await;
+                        }
+                        let _ = out_tx.send(Ok(StreamItem::Done(StopReason::Cancelled))).await;
+                        break;
+                    }
+                    item = rx.recv() => {
+                        match item {
+                            Some(val) => {
+                                let is_done = matches!(val, Ok(StreamItem::Done(_)));
+                                if out_tx.send(val).await.is_err() || is_done {
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                }
             }
         });
 
-        Ok(ChatStream::new(rx))
+        Ok(ChatStream::new(out_rx))
     }
 
     async fn embed(&self, _input: Vec<String>) -> Result<Vec<Vec<f32>>, ModelError> {
@@ -416,6 +436,10 @@ impl ModelBackend for HydrogenBackend {
 
     #[tracing::instrument(level = "debug", skip_all)]
     async fn health(&self) -> Result<BackendHealth, ModelError> {
+        if self.activity.in_flight() > 0 {
+            return Ok(BackendHealth::Ok);
+        }
+
         let notified = self.pong_notify.notified();
 
         {

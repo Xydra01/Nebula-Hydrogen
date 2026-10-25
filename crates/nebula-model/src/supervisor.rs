@@ -360,12 +360,12 @@ impl Actor {
     }
 
     async fn park(&mut self, state: ModelState) {
+        self.set_state(state, None);
         self.drain().await;
         self.teardown().await;
         self.restart_at = None;
         let parked = Err(ModelError::Unavailable(format!("model {state:?}")));
         self.resolve_waiters(&parked);
-        self.set_state(state, None);
     }
 
     /// Waits for in-flight requests up to the drain timeout, then cancels the rest.

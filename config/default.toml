@@ -351,6 +351,7 @@ desktop_allowlist = [
     "cmd.exe",
     "taskmgr.exe",
     "llama-server.exe",
+    "hydrogen_engine.exe",
 ]
 
 # Remote push notifications over Tailscale via ntfy (issue #37, design Section 4.5).
