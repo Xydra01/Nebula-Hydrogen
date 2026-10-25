@@ -1,0 +1,13 @@
+{
+  "id": "task_07_rs_bounded_ring",
+  "name": "Rust Safe Bounded Ring Buffer Refactor",
+  "language": "rust",
+  "family": "F-refactor",
+  "prompt": "Refactor src/lib.rs to eliminate all unsafe raw pointer manipulation in BoundedRingBuffer, replacing it with safe slice indexing and wrapping arithmetic while preserving exact capacity and FIFO behavior. Ensure cargo test passes.",
+  "check_command": "cargo test --locked",
+  "limits": {
+    "max_tool_calls": 8,
+    "max_tokens": 4096,
+    "wall_time_secs": 180
+  }
+}

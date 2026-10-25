@@ -3,13 +3,13 @@ source: crates/nebula-cli/tests/tui.rs
 expression: terminal.backend()
 ---
 "╭ Status ──────────────────────────────────────────────────────────────────────────────────────────────────────────────╮"
-"│ Nebula v0.1.0 | Uptime: 62m 5s | Model: code (Ready)                                                                 │"
+"│ Nebula v0.1.0 | Uptime: 62m 5s | Model: code (Ready) | Lang: Auto [MCP: OK]                                          │"
 "╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯"
 "╭ Resources ───────────────────────────────────────────────────────────────────────────────────────────────────────────╮"
 "│VRAM: 9.1/12.0 GB (76%)  |  Commit: 36.1/63.8 GB (57%)  |  GPU: 87%  |  CPU: 12.4%                                    │"
 "╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯"
 "┏ Tasks (Tab: 1) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓╭ Streaming Model Output (Tab: 2) [Auto-Scroll] ───────────────────────╮"
-"┃> [RUNNING] 01J9ZQ3V5W8X0Y2Z4A6B8C0D2E.. (step┃│Analyzing schema definitions in crates/nebula-db/src/migrations.rs... │"
+"┃> [RUNNING] [rust] 01J9ZQ3V5W8X0Y2Z4A6B8C0D2E.┃│Analyzing schema definitions in crates/nebula-db/src/migrations.rs... │"
 "┃                                              ┃│Found 4 migrations requiring transactional boundaries.                │"
 "┃                                              ┃│                                                                      │"
 "┃                                              ┃│                                                                      │"
@@ -33,4 +33,4 @@ expression: terminal.backend()
 "│                                              ││                                                                      │"
 "│                                              ││                                                                      │"
 "╰──────────────────────────────────────────────╯╰──────────────────────────────────────────────────────────────────────╯"
-"[q] Quit  [Tab] Cycle Pane  [↑/↓] Navigate/Scroll  [r] Refresh  [a] Approve  [d] Deny                                   "
+"[q] Quit  [Tab] Cycle Pane  [↑/↓] Navigate  [r] Refresh  [l] Language  [g] Diagnostics  [a] Approve  [d] Deny           "

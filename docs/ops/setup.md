@@ -207,6 +207,16 @@ Put `F:\Nebula\bin` on the user PATH once, then open a new terminal:
 
 Then `nebula daemon start`, `nebula doctor`, `nebula chat`. `nebula --help` lists everything.
 
+### Daemon auto-start at logon
+
+To start the daemon automatically after reboot and logon (Issue #38):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\register-daemon-task.ps1
+```
+
+This registers a Task Scheduler task (`\Nebula\Nebula daemon (logon)`) under your user account with a 30-second delay so it does not compete with desktop startup. Use `-Unregister` to remove it.
+
 ## 9. GitHub repo settings (only if the repo is recreated)
 
 These live on GitHub, not on the machine. Current state, for reference:

@@ -1,0 +1,13 @@
+{
+  "id": "task_03_py_fast_tokenizer",
+  "name": "Tokenizer Modular Refactor",
+  "language": "python",
+  "family": "F-refactor",
+  "prompt": "Refactor the BPE tokenizer in tokenizer.py into clean modular components (pre_tokenize, bpe_encode, and Tokenizer class) while keeping all tests in test_tokenizer.py green.",
+  "check_command": "pytest test_tokenizer.py -q",
+  "limits": {
+    "max_tool_calls": 8,
+    "max_tokens": 4096,
+    "wall_time_secs": 120
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "id": "task_06_rs_word_frequency",
+  "name": "Rust Word Frequency Counter",
+  "language": "rust",
+  "family": "F-feature",
+  "prompt": "Write pub fn word_freq(text: &str) -> Vec<(String, usize)> in src/lib.rs. Words are maximal runs of ASCII alphanumeric characters, compared case-insensitively and returned in order: frequency descending, ties sorted alphabetically ascending. Ensure cargo test passes.",
+  "check_command": "cargo test --locked",
+  "limits": {
+    "max_tool_calls": 8,
+    "max_tokens": 4096,
+    "wall_time_secs": 180
+  }
+}

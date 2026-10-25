@@ -126,6 +126,7 @@ fn parses_every_command() {
                 pr,
                 no_pr,
                 language,
+                python_version: _,
                 verification_target,
             }),
     } = parse(&[

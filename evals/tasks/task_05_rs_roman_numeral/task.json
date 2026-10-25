@@ -1,0 +1,13 @@
+{
+  "id": "task_05_rs_roman_numeral",
+  "name": "Rust Roman Numeral Parser Bugfix",
+  "language": "rust",
+  "family": "F-bugfix",
+  "prompt": "Fix standard Roman numeral conversion in src/lib.rs to correctly reject invalid/non-canonical forms (e.g. 'IIII', 'VX', 'IC', 'MMMM', 'ABC') and empty strings by returning None, while correctly parsing valid numerals between 1 and 3999. Ensure cargo test passes.",
+  "check_command": "cargo test --locked",
+  "limits": {
+    "max_tool_calls": 8,
+    "max_tokens": 4096,
+    "wall_time_secs": 180
+  }
+}

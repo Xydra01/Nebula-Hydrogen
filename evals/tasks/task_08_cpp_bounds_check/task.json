@@ -1,0 +1,13 @@
+{
+  "id": "task_08_cpp_bounds_check",
+  "name": "C++ BufferView Bounds Bugfix",
+  "language": "cpp",
+  "family": "F-bugfix",
+  "prompt": "Fix the boundary check defect in src/buffer_view.cpp where subview slicing at start + length == size() triggers an invalid out-of-bounds error. Ensure CMake configuration and CTest pass.",
+  "check_command": "ctest --output-on-failure",
+  "limits": {
+    "max_tool_calls": 8,
+    "max_tokens": 4096,
+    "wall_time_secs": 180
+  }
+}

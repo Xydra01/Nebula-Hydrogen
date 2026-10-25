@@ -1,0 +1,13 @@
+{
+  "id": "task_09_cpp_ring_buffer",
+  "name": "C++ Atomic SPSC Ring Buffer",
+  "language": "cpp",
+  "family": "F-feature",
+  "prompt": "Implement a single-producer single-consumer lock-free bounded ring buffer in include/atomic_ring.hpp using std::atomic indices with acquire/release memory orderings. Ensure CMake configuration and CTest pass.",
+  "check_command": "ctest --output-on-failure",
+  "limits": {
+    "max_tool_calls": 8,
+    "max_tokens": 4096,
+    "wall_time_secs": 180
+  }
+}

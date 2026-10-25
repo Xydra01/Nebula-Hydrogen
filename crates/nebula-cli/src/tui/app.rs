@@ -52,8 +52,12 @@ pub enum TuiTaskStatus {
     Running,
     /// Successfully completed.
     Completed,
+    /// Voluntarily completed via task.finish.
+    Finished,
     /// Reached budget or limit.
     LimitReached,
+    /// Committing worktree changes.
+    Committing,
     /// Cancelled.
     Cancelled,
     /// Failed with error.
@@ -71,6 +75,23 @@ impl From<TaskStatus> for TuiTaskStatus {
     }
 }
 
+/// A structured compiler or build diagnostic parsed from tool/process output.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiagnosticItem {
+    /// Source file path.
+    pub file: String,
+    /// 1-based line number.
+    pub line: u32,
+    /// 1-based column number.
+    pub col: u32,
+    /// Diagnostic severity (e.g. "error", "warning").
+    pub severity: String,
+    /// Optional error/warning code (e.g. "C2065", "E0308").
+    pub code: Option<String>,
+    /// Diagnostic message text.
+    pub message: String,
+}
+
 /// A task item displayed in the tasks list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskItem {
@@ -82,6 +103,10 @@ pub struct TaskItem {
     pub summary: String,
     /// Number of tool steps completed.
     pub step_count: usize,
+    /// Active language module identifier.
+    pub language: Option<String>,
+    /// Whether the language MCP process is healthy.
+    pub mcp_healthy: bool,
 }
 
 /// A recorded tool call step.
@@ -114,7 +139,7 @@ pub enum TuiAction {
 }
 
 /// Application state for the Nebula TUI.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TuiApp {
     /// Recent tasks.
     pub tasks: Vec<TaskItem>,
@@ -130,6 +155,18 @@ pub struct TuiApp {
     pub tool_calls: VecDeque<ToolCallItem>,
     /// Selected index in tool calls.
     pub selected_tool_call: usize,
+    /// Parsed compiler and build diagnostics.
+    pub diagnostics: Vec<DiagnosticItem>,
+    /// Whether structured diagnostic viewer pane is open.
+    pub show_diagnostics: bool,
+    /// Whether language picker modal is open.
+    pub language_picker_open: bool,
+    /// Available languages in the picker.
+    pub available_languages: Vec<String>,
+    /// Selected index in language picker.
+    pub selected_language_idx: usize,
+    /// User-selected active language override.
+    pub active_language: Option<String>,
     /// Latest resource snapshot.
     pub resources: Option<ResourceSnapshot>,
     /// Latest daemon status.
@@ -150,18 +187,79 @@ pub struct TuiApp {
     pub pending_actions: VecDeque<TuiAction>,
 }
 
+impl Default for TuiApp {
+    fn default() -> Self {
+        Self {
+            tasks: Vec::new(),
+            selected_task: 0,
+            streaming_text: String::new(),
+            streaming_scroll: 0,
+            auto_scroll: true,
+            tool_calls: VecDeque::new(),
+            selected_tool_call: 0,
+            diagnostics: Vec::new(),
+            show_diagnostics: false,
+            language_picker_open: false,
+            available_languages: vec![
+                "Auto-detect".into(),
+                "rust".into(),
+                "python".into(),
+                "cpp".into(),
+                "sql".into(),
+            ],
+            selected_language_idx: 0,
+            active_language: None,
+            resources: None,
+            daemon_status: None,
+            game_mode: None,
+            pending_approval: None,
+            approval_modal_open: false,
+            show_details: false,
+            active_pane: ActivePane::Tasks,
+            should_quit: false,
+            pending_actions: VecDeque::new(),
+        }
+    }
+}
+
 impl TuiApp {
     /// Creates a fresh TUI state.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            auto_scroll: true,
-            ..Self::default()
-        }
+        Self::default()
     }
 
     /// Handles keyboard input.
     pub fn handle_key(&mut self, key: KeyEvent) {
+        // Language picker intercepts keys
+        if self.language_picker_open {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if self.selected_language_idx > 0 {
+                        self.selected_language_idx -= 1;
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if self.selected_language_idx + 1 < self.available_languages.len() {
+                        self.selected_language_idx += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    self.active_language = if self.selected_language_idx == 0 {
+                        None
+                    } else {
+                        Some(self.available_languages[self.selected_language_idx].clone())
+                    };
+                    self.language_picker_open = false;
+                }
+                KeyCode::Esc | KeyCode::Char('l' | 'L') => {
+                    self.language_picker_open = false;
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // Modal mode intercepts keys first
         if self.approval_modal_open {
             match key.code {
@@ -216,6 +314,12 @@ impl TuiApp {
             }
             (KeyCode::Char('r'), _) => {
                 self.pending_actions.push_back(TuiAction::RefreshResources);
+            }
+            (KeyCode::Char('l' | 'L'), _) => {
+                self.language_picker_open = true;
+            }
+            (KeyCode::Char('g' | 'G'), _) => {
+                self.show_diagnostics = !self.show_diagnostics;
             }
             // Pane-specific navigation
             (KeyCode::Up | KeyCode::Char('k'), _) => match self.active_pane {
@@ -308,6 +412,7 @@ impl TuiApp {
                     {
                         tc.status = "ok".into();
                     }
+                    extract_diagnostics(&t.text, &mut self.diagnostics);
                     self.streaming_text.push_str(&t.text);
                 }
                 if self.auto_scroll {
@@ -324,6 +429,8 @@ impl TuiApp {
                         status: TuiTaskStatus::Running,
                         summary: format!("Task {}", step.task_id),
                         step_count: step.step_index as usize,
+                        language: self.active_language.clone(),
+                        mcp_healthy: true,
                     });
                 }
 
@@ -360,15 +467,29 @@ impl TuiApp {
                 }
             }
             Event::TaskDone(done) => {
+                let resolved_status = if done.summary.contains("task.finish") {
+                    TuiTaskStatus::Finished
+                } else if done.summary.contains("limit_reached")
+                    || done.status == nebula_proto::TaskStatus::LimitReached
+                {
+                    TuiTaskStatus::LimitReached
+                } else if done.summary.contains("committing") {
+                    TuiTaskStatus::Committing
+                } else {
+                    done.status.into()
+                };
+
                 if let Some(task) = self.tasks.iter_mut().find(|t| t.id == done.task_id) {
-                    task.status = done.status.into();
+                    task.status = resolved_status;
                     task.summary = done.summary.clone();
                 } else {
                     self.tasks.push(TaskItem {
                         id: done.task_id,
-                        status: done.status.into(),
+                        status: resolved_status,
                         summary: done.summary.clone(),
                         step_count: 0,
+                        language: self.active_language.clone(),
+                        mcp_healthy: true,
                     });
                 }
 
@@ -440,5 +561,71 @@ impl TuiApp {
     /// Updates daemon status.
     pub fn update_daemon_status(&mut self, status: DaemonStatus) {
         self.daemon_status = Some(status);
+    }
+}
+
+/// Helper to parse compiler and build diagnostics from streamed text.
+fn extract_diagnostics(text: &str, out: &mut Vec<DiagnosticItem>) {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        // MSVC pattern: path(line,col): error/warning Cxxxx: msg
+        if let Some(paren_open) = trimmed.find('(')
+            && let Some(paren_close) = trimmed[paren_open..].find(')')
+        {
+            let close_idx = paren_open + paren_close;
+            let file = trimmed[..paren_open].trim();
+            let coords = &trimmed[paren_open + 1..close_idx];
+            let rest = trimmed[close_idx + 1..].trim_start_matches(':').trim();
+            if let Some((l_str, c_str)) = coords.split_once(',')
+                && let (Ok(line_no), Ok(col_no)) =
+                    (l_str.trim().parse::<u32>(), c_str.trim().parse::<u32>())
+            {
+                let severity = if rest.starts_with("error") {
+                    "error"
+                } else if rest.starts_with("warning") {
+                    "warning"
+                } else {
+                    "info"
+                };
+                if severity != "info" {
+                    out.push(DiagnosticItem {
+                        file: file.to_string(),
+                        line: line_no,
+                        col: col_no,
+                        severity: severity.to_string(),
+                        code: None,
+                        message: rest.to_string(),
+                    });
+                    continue;
+                }
+            }
+        }
+        // Clang/GCC/Rust pattern: path:line:col: error/warning: msg
+        let parts: Vec<&str> = trimmed.splitn(5, ':').collect();
+        if parts.len() >= 4
+            && let (Ok(line_no), Ok(col_no)) = (
+                parts[1].trim().parse::<u32>(),
+                parts[2].trim().parse::<u32>(),
+            )
+        {
+            let rest = parts[3..].join(":").trim().to_string();
+            let severity = if rest.starts_with("error") {
+                "error"
+            } else if rest.starts_with("warning") {
+                "warning"
+            } else {
+                "info"
+            };
+            if severity != "info" {
+                out.push(DiagnosticItem {
+                    file: parts[0].trim().to_string(),
+                    line: line_no,
+                    col: col_no,
+                    severity: severity.to_string(),
+                    code: None,
+                    message: rest,
+                });
+            }
+        }
     }
 }

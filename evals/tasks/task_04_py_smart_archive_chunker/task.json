@@ -1,0 +1,13 @@
+{
+  "id": "task_04_py_smart_archive_chunker",
+  "name": "Smart Archive Markdown Chunker",
+  "language": "python",
+  "family": "F-feature",
+  "prompt": "Implement a semantic markdown chunker in chunker.py that splits markdown text by headers (#, ##, ###) while maintaining parent section titles in chunk metadata and respecting max_tokens. Ensure all tests in test_chunker.py pass.",
+  "check_command": "pytest test_chunker.py -q",
+  "limits": {
+    "max_tool_calls": 8,
+    "max_tokens": 4096,
+    "wall_time_secs": 120
+  }
+}

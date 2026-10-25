@@ -1,0 +1,13 @@
+{
+  "id": "task_01_py_interval_merge",
+  "name": "Interval Merge Bugfix",
+  "language": "python",
+  "family": "F-bugfix",
+  "prompt": "Fix the bug in interval_merger.py where touching closed intervals (e.g. (1, 3) and (3, 5)) fail to merge into (1, 5), and unsorted inputs or empty lists cause incorrect output. Ensure all tests in test_interval_merger.py pass.",
+  "check_command": "pytest test_interval_merger.py -q",
+  "limits": {
+    "max_tool_calls": 8,
+    "max_tokens": 4096,
+    "wall_time_secs": 120
+  }
+}
