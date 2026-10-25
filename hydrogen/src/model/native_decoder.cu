@@ -1081,6 +1081,9 @@ ToolCall parse_tool_call_json(const std::string& raw_json, uint32_t stream_id) {
                 size_t q2 = raw_json.find('"', q1 + 1);
                 if (q2 != std::string::npos) {
                     result.name = raw_json.substr(q1 + 1, q2 - (q1 + 1));
+                    result.name.erase(std::remove_if(result.name.begin(), result.name.end(), [](unsigned char c) {
+                        return std::isspace(c);
+                    }), result.name.end());
                 }
             }
         }
