@@ -34,3 +34,14 @@ source = "https://github.com/ggml-org/llama.cpp/releases/tag/b11342"
 [llama-stock.archives]
 "llama-b11342-bin-win-cuda-12.4-x64.zip" = "78e15a116a372a3ac5bb654c31709bee45f575d01e2e967b42ec6395cced9a64"
 "cudart-llama-bin-win-cuda-12.4-x64.zip" = "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6"
+
+# Native Hydrogen C++20/CUDA inference engine for Project Neutron
+[hydrogen]
+release = "hydrogen-v0.1.0"
+commit = "5c7670663dfa5bd3318434dbfea8c17fadb860c7"
+build = 1
+version = "0.1.0"
+published = "2026-10-24"
+variant = "win-cuda-13.2-sm89"
+install_dir = 'F:\Nebula\runtime\hydrogen'
+

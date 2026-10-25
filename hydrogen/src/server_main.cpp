@@ -267,7 +267,20 @@ int main(int argc, char* argv[]) {
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if ((arg == "-m" || arg == "--model") && i + 1 < argc) {
+        if (arg == "--version" || arg == "-v") {
+            std::cout << "hydrogen build 1, commit 5c7670663dfa5bd3318434dbfea8c17fadb860c7 (sm_89 ada lovelace)\n";
+            return 0;
+        } else if (arg == "--help" || arg == "-h") {
+            std::cout << "Usage: hydrogen_engine [options]\n"
+                      << "  -m, --model <path>      Path to GGUF model file\n"
+                      << "  -c, --ctx <tokens>      Context size (default: 32768)\n"
+                      << "  --shm-name <name>       Shared memory mapping name\n"
+                      << "  --engine-event <name>   Engine event name\n"
+                      << "  --daemon-event <name>   Daemon event name\n"
+                      << "  -v, --version           Print version and exit\n"
+                      << "  -h, --help              Print help and exit\n";
+            return 0;
+        } else if ((arg == "-m" || arg == "--model") && i + 1 < argc) {
             model_path_str = argv[++i];
         } else if ((arg == "-c" || arg == "--ctx") && i + 1 < argc) {
             ctx_len = std::stoi(argv[++i]);

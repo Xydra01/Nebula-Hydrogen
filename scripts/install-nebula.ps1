@@ -29,5 +29,13 @@ if (-not (Test-Path $destDevtools)) {
     New-Item -ItemType Junction -Path $destDevtools -Target $targetDevtools | Out-Null
 }
 
+$hydrogenBin = Join-Path $repo 'hydrogen\build\bin\hydrogen_engine.exe'
+if (Test-Path $hydrogenBin) {
+    $runtimeHydrogen = 'F:\Nebula\runtime\hydrogen'
+    New-Item -ItemType Directory -Force -Path $runtimeHydrogen | Out-Null
+    Copy-Item -Force $hydrogenBin (Join-Path $runtimeHydrogen 'hydrogen_engine.exe')
+    Write-Host "Installed hydrogen_engine to $runtimeHydrogen"
+}
+
 Write-Host "Installed to $bin"
 & (Join-Path $bin 'nebula.exe') --version
